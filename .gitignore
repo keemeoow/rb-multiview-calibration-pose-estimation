@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+
+# Large model artifacts
+src/checkpoints/
+
+# OS files
+.DS_Store
