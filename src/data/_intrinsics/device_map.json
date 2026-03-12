@@ -1,0 +1,23 @@
+{
+  "created_at_epoch": 1772116977.0179665,
+  "updated_at_epoch": 1772118513.8551424,
+  "serial_to_idx": {
+    "039422061216": 0,
+    "314522062542": 1,
+    "912322060991": 2
+  },
+  "detected_now": [
+    {
+      "serial": "912322060991",
+      "name": "Intel RealSense D415"
+    },
+    {
+      "serial": "039422061216",
+      "name": "Intel RealSense D415"
+    },
+    {
+      "serial": "314522062542",
+      "name": "Intel RealSense D415"
+    }
+  ]
+}
