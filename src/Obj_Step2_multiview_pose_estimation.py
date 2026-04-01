@@ -57,6 +57,8 @@ python3 src/Obj_Step2_multiview_pose_estimation.py \
 import argparse
 import sys
 import os
+import json
+import shutil
 import warnings
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -211,9 +213,18 @@ class DataLoader:
 
         mesh = self.load_reference_mesh(print_info=False)
         if mesh is not None:
-            pts, _ = trimesh.sample.sample_surface(mesh, 30000, seed=0)
+            pts, face_idx = trimesh.sample.sample_surface(mesh, 30000, seed=0)
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(pts)
+            # GLB 메시에서 색상 추출 (Colored ICP 지원)
+            try:
+                face_colors = mesh.visual.face_colors
+                if face_colors is not None and len(face_colors) > 0:
+                    colors = face_colors[face_idx][:, :3].astype(np.float64) / 255.0
+                    if np.std(colors) > 0.01:
+                        pcd.colors = o3d.utility.Vector3dVector(colors)
+            except Exception:
+                pass
             print(f"  [REF] GLB → 점군: {len(pts)} pts")
             return pcd
 
@@ -721,10 +732,10 @@ class PoseEstimator:
         return float(np.minimum(desc_ref, desc_query).sum())
 
     @staticmethod
-    def _pca_candidate_transforms(src_pts, dst_pts):
+    def _pca_candidate_transforms_extended(src_pts, dst_pts):
         """
-        src(모델)를 dst(클러스터)에 PCA 축 정렬.
-        축 부호 모호성(4가지 조합)의 변환 행렬을 모두 반환.
+        PCA 축 부호 조합(4) × 축 순서 치환(3) + 주축 대칭 회전(3) = 총 15개 후보.
+        부분 관측 시 축 모호성과 대칭 물체의 회전 모호성 해소.
         """
         R_src, _ = PoseEstimator._pca_axes(src_pts)
         R_dst, _ = PoseEstimator._pca_axes(dst_pts)
@@ -732,20 +743,34 @@ class PoseEstimator:
         dst_center = dst_pts.mean(axis=0)
 
         candidates = []
-        for s1 in [1, -1]:
-            for s2 in [1, -1]:
-                R_flip = R_src.copy()
-                R_flip[:, 0] *= s1
-                R_flip[:, 1] *= s2
-                R_flip[:, 2] = np.cross(R_flip[:, 0], R_flip[:, 1])
+        # 축 순서 치환: identity, (0↔1), (0↔2)
+        axis_perms = [[0, 1, 2], [1, 0, 2], [2, 1, 0]]
+        for perm in axis_perms:
+            R_src_perm = R_src[:, perm]
+            for s1 in [1, -1]:
+                for s2 in [1, -1]:
+                    R_flip = R_src_perm.copy()
+                    R_flip[:, 0] *= s1
+                    R_flip[:, 1] *= s2
+                    R_flip[:, 2] = np.cross(R_flip[:, 0], R_flip[:, 1])
+                    R_align = R_dst @ R_flip.T
+                    t = dst_center - R_align @ src_center
+                    T = np.eye(4)
+                    T[:3, :3] = R_align
+                    T[:3, 3] = t
+                    candidates.append(T)
 
-                R_align = R_dst @ R_flip.T
-                t = dst_center - R_align @ src_center
-
-                T = np.eye(4)
-                T[:3, :3] = R_align
-                T[:3, 3] = t
-                candidates.append(T)
+        # dst 주축 기준 90° 단위 대칭 회전 추가
+        base_R = R_dst @ R_src.T
+        for angle_deg in [90, 180, 270]:
+            rv = R_dst[:, 0] * np.deg2rad(angle_deg)
+            R_sym = Rotation.from_rotvec(rv).as_matrix()
+            R_align = R_sym @ base_R
+            t = dst_center - R_align @ src_center
+            T = np.eye(4)
+            T[:3, :3] = R_align
+            T[:3, 3] = t
+            candidates.append(T)
 
         return candidates
 
@@ -789,44 +814,40 @@ class PoseEstimator:
         return result
 
     @staticmethod
-    def _find_target_cluster(objects_pcd, labels, unique_labels):
-        """
-        색상 기반 물체 식별: 노란색 비율이 가장 높은 클러스터를 반환.
-        색상 정보가 없으면 -1 반환.
-        """
-        if not objects_pcd.has_colors():
-            return -1, 0.0
+    def _visible_surface_filter(model_pcd, camera_data_list):
+        """카메라 시점에서 보이는 모델 표면만 추출 (Hidden Point Removal).
+        부분 관측 데이터와의 ICP 정확도를 높이기 위해 사용."""
+        all_visible = set()
+        diameter = np.linalg.norm(
+            model_pcd.get_max_bound() - model_pcd.get_min_bound()
+        )
+        if diameter < 1e-6:
+            return model_pcd
+        radius = diameter * 100
 
-        all_colors = np.asarray(objects_pcd.colors)
-        best_label, best_ratio = -1, 0.0
-
-        for label in unique_labels:
-            idx = np.where(labels == label)[0]
-            if len(idx) < 100:
+        for cam_data in camera_data_list:
+            cam_pos = cam_data.T_to_cam0[:3, 3].copy()
+            try:
+                _, pt_map = model_pcd.hidden_point_removal(cam_pos, radius)
+                all_visible.update(pt_map)
+            except Exception:
                 continue
-            cl_colors = all_colors[idx]
-            yellow = ((cl_colors[:, 0] > 0.4) &
-                      (cl_colors[:, 1] > 0.3) &
-                      (cl_colors[:, 2] < 0.35))
-            ratio = yellow.sum() / len(cl_colors)
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_label = label
 
-        return best_label, best_ratio
+        if len(all_visible) < 50:
+            return model_pcd
+
+        return model_pcd.select_by_index(list(all_visible))
 
     @staticmethod
     def estimate_pose(
         objects_pcd: o3d.geometry.PointCloud,
         ref_pcd: o3d.geometry.PointCloud,
         voxel_size: float = 0.005,
-        table_plane: Optional[np.ndarray] = None,
         object_size_m: Optional[float] = None,
         camera_data_list: Optional[list] = None,
         edge_context: Optional[Dict[str, list]] = None,
         observation_context: Optional[Dict[str, list]] = None,
         mesh_render_context: Optional[Dict[str, list]] = None,
-        direct_match: bool = False,  # kept for API compat, ignored
     ) -> Tuple[PoseResult, o3d.geometry.PointCloud, float]:
         """
         1) GLB를 실제 크기로 스케일링 (object_size_m 또는 클러스터 자동 추정)
@@ -944,9 +965,20 @@ class PoseEstimator:
             T_init = np.eye(4)
             T_init[:3, 3] = cl_center  # 원점 → 클러스터 중심
 
-            # PCA 4후보 (클러스터 중심 기준)
-            cand_Ts = PoseEstimator._pca_candidate_transforms(model_pts_s, cl_pts)
+            # PCA 확장 후보 (축 치환 + 대칭 회전) + FPFH 글로벌 정합
+            cand_Ts = PoseEstimator._pca_candidate_transforms_extended(model_pts_s, cl_pts)
             cand_Ts.append(T_init)  # centroid 후보도 포함
+            try:
+                fpfh_result = PoseEstimator._fpfh_global_registration(
+                    o3d.geometry.PointCloud(model_s),
+                    o3d.geometry.PointCloud(cluster),
+                    voxel_size,
+                )
+                if fpfh_result.fitness > 0.05:
+                    cand_Ts.append(np.array(fpfh_result.transformation))
+                    print(f"    FPFH 후보 추가 (fitness={fpfh_result.fitness:.3f})")
+            except Exception:
+                pass
 
             cluster.estimate_normals(
                 o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3, max_nn=30)
@@ -1041,18 +1073,65 @@ class PoseEstimator:
             raise RuntimeError("매칭 가능한 클러스터를 찾지 못했습니다. "
                                "--object_size_m 범위를 확인하세요.")
 
-        # 최적 클러스터로 정밀 ICP
+        # 최적 클러스터로 정밀 ICP (Multi-scale + Visible Surface)
         model_s = best_result["model_s"]
         cluster = best_result["cluster"]
         cand_T = best_result["cand_T"]
         icp0 = best_result["icp_res"]
-        max_dist = max(voxel_size * 4, object_size_m * 0.3 if object_size_m else 0.02)
+        base_dist = max(voxel_size * 2.5, object_size_m * 0.10 if object_size_m else 0.008)
 
         model_after_cand = o3d.geometry.PointCloud(model_s)
         model_after_cand.transform(cand_T)
-        fine = _run_icp(model_after_cand, o3d.geometry.PointCloud(cluster),
-                        icp0.transformation, max_dist)
-        print(f"\n  정밀 ICP: fitness={fine.fitness:.4f}  RMSE={fine.inlier_rmse:.6f}")
+
+        # Visible surface filtering: ICP에 보이는 면만 사용
+        model_for_icp = model_after_cand
+        if camera_data_list:
+            model_visible = PoseEstimator._visible_surface_filter(
+                model_after_cand, camera_data_list
+            )
+            if len(model_visible.points) > 100:
+                model_for_icp = model_visible
+                print(f"  Visible surface: {len(model_after_cand.points)} → {len(model_visible.points)} pts")
+
+        # Multi-scale coarse-to-fine ICP
+        target_cluster = o3d.geometry.PointCloud(cluster)
+        for p in [model_for_icp, target_cluster]:
+            if not p.has_normals():
+                p.estimate_normals(
+                    o3d.geometry.KDTreeSearchParamHybrid(radius=base_dist * 4, max_nn=30)
+                )
+        current_T = icp0.transformation
+        fine = None
+        for icp_scale, icp_iter in [(4.0, 50), (2.0, 80), (1.0, 150)]:
+            fine = o3d.pipelines.registration.registration_icp(
+                model_for_icp, target_cluster,
+                max_correspondence_distance=base_dist * icp_scale,
+                init=current_T,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                    relative_fitness=1e-7, relative_rmse=1e-7, max_iteration=icp_iter,
+                ),
+            )
+            current_T = fine.transformation
+
+        # Colored ICP 최종 정밀화 (색상 정보가 있을 때)
+        if model_for_icp.has_colors() and target_cluster.has_colors():
+            try:
+                fine_color = o3d.pipelines.registration.registration_colored_icp(
+                    model_for_icp, target_cluster,
+                    max_correspondence_distance=base_dist,
+                    init=current_T,
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                    criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                        relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=100,
+                    ),
+                )
+                if fine_color.fitness >= fine.fitness * 0.8:
+                    fine = fine_color
+                    print(f"  Colored ICP 적용됨: fitness={fine_color.fitness:.4f}")
+            except Exception:
+                pass
+        print(f"\n  정밀 ICP (Multi-scale): fitness={fine.fitness:.4f}  RMSE={fine.inlier_rmse:.6f}")
 
         # 누적 변환: T_fine @ T_cand (model_s 원점 기준)
         T_total = np.array(fine.transformation) @ cand_T
@@ -2020,8 +2099,14 @@ def save_aligned_glb(
     pose: PoseResult,
     scale: float,
     output_path: str,
+    transform_mode: str = "bake",
 ):
-    """원본 GLB에 scale + pose를 bake해서 cam0 좌표계 기준 GLB로 저장."""
+    """원본 GLB에 scale + pose를 반영한 cam0 좌표계 기준 GLB 저장.
+
+    transform_mode:
+      - "bake": 정점 좌표에 직접 반영 (mesh bake)
+      - "node": 노드 transform(matrix)에 반영
+    """
     src_path = Path(source_glb_path)
     if not src_path.exists():
         print(f"  [WARNING] 정합 GLB 저장 생략: 입력 GLB 없음 ({src_path})")
@@ -2045,11 +2130,25 @@ def save_aligned_glb(
 
     pose_T = np.asarray(pose.transform_4x4, dtype=np.float64)
     export_T = pose_T @ scale_T @ center_T
-    scene.apply_transform(export_T)
+    mode = str(transform_mode).lower().strip()
+    if mode == "node":
+        for node_name in list(scene.graph.nodes_geometry):
+            node_T, _ = scene.graph.get(frame_to=node_name)
+            scene.graph.update(frame_to=node_name, matrix=export_T @ node_T)
+        scene.metadata = dict(scene.metadata or {})
+        scene.metadata["rb_pose_cam0"] = {
+            "transform_4x4": pose.transform_4x4.tolist(),
+            "scale_uniform": float(scale),
+            "translation_xyz_m": pose.translation.tolist(),
+            "rotation_quaternion_xyzw": pose.quaternion_xyzw.tolist(),
+            "rotation_euler_xyz_deg": pose.euler_xyz_deg.tolist(),
+        }
+    else:
+        scene.apply_transform(export_T)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     scene.export(output_path)
-    print(f"  정합 GLB 저장: {output_path}")
+    print(f"  정합 GLB 저장({mode}): {output_path}")
 
 
 def validate_identity_confidence(
@@ -2082,6 +2181,70 @@ def validate_identity_confidence(
             f"({detail})  "
             "ROI를 지정하거나 프레임을 바꾸거나 threshold를 완화해 주세요."
         )
+
+
+def list_available_frame_ids(data_dir: str) -> list:
+    cam0_dir = Path(data_dir) / "object_capture" / "cam0"
+    if not cam0_dir.exists():
+        return []
+    ids = []
+    for p in sorted(cam0_dir.glob("rgb_*.jpg")):
+        stem = p.stem
+        if "_" not in stem:
+            continue
+        fid = stem.split("_", 1)[1]
+        if fid.isdigit():
+            ids.append(fid)
+    return ids
+
+
+def parse_frame_search_spec(spec: Optional[str], available_ids: list) -> list:
+    if not available_ids:
+        return []
+    if spec is None or str(spec).strip() == "":
+        return available_ids
+
+    wanted_int = set()
+    wanted_raw = set()
+    for token in str(spec).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            a, b = token.split("-", 1)
+            a = a.strip()
+            b = b.strip()
+            if (not a.isdigit()) or (not b.isdigit()):
+                continue
+            ia, ib = int(a), int(b)
+            lo, hi = min(ia, ib), max(ia, ib)
+            for i in range(lo, hi + 1):
+                wanted_int.add(i)
+        else:
+            if token.isdigit():
+                wanted_int.add(int(token))
+            else:
+                wanted_raw.add(token)
+
+    filtered = []
+    for fid in available_ids:
+        if fid in wanted_raw:
+            filtered.append(fid)
+            continue
+        if fid.isdigit() and int(fid) in wanted_int:
+            filtered.append(fid)
+    return filtered
+
+
+def identity_confidence_score(pose: PoseResult) -> float:
+    return float(
+        pose.fitness
+        * max(pose.coverage, 1e-4)
+        * max(pose.observation_score, 1e-4)
+        * max(pose.mesh_render_score, 1e-4)
+        * max(pose.descriptor_score, 1e-4)
+        / (1.0 + pose.edge_cost_px / 20.0)
+    )
 
 
 def parse_roi_arg(roi_str: str) -> Tuple[int, int, int, int]:
@@ -2117,7 +2280,6 @@ def estimate_pose_with_proposals(
     proposals: list,
     camera_data_list: list,
     args,
-    table_plane: Optional[np.ndarray] = None,
     edge_context: Optional[Dict[str, list]] = None,
     observation_context: Optional[Dict[str, list]] = None,
     mesh_render_context: Optional[Dict[str, list]] = None,
@@ -2142,7 +2304,6 @@ def estimate_pose_with_proposals(
                 proposal_pcd,
                 ref_pcd,
                 voxel_size=args.voxel_size,
-                table_plane=table_plane,
                 object_size_m=getattr(args, "object_size_m", None),
                 camera_data_list=camera_data_list,
                 edge_context=edge_context,
@@ -2215,6 +2376,7 @@ def run_pipeline(args):
     print("=" * 60)
     print(" 멀티뷰 RGB-D 기반 물체 포즈 추정")
     print("=" * 60)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # --- 데이터 로드 ---
     print("\n[1/5] 데이터 로드")
@@ -2362,7 +2524,6 @@ def run_pipeline(args):
             proposals,
             camera_data_list,
             args,
-            table_plane=table_plane,
             edge_context=edge_context,
             observation_context=observation_context,
             mesh_render_context=mesh_render_context,
@@ -2385,7 +2546,6 @@ def run_pipeline(args):
     else:
         pose, model_aligned, scale = PoseEstimator.estimate_pose(
             objects_pcd, ref_pcd, voxel_size=args.voxel_size,
-            table_plane=table_plane,
             object_size_m=getattr(args, "object_size_m", None),
             camera_data_list=camera_data_list,
             edge_context=edge_context,
@@ -2440,6 +2600,15 @@ def run_pipeline(args):
         pose,
         scale,
         os.path.join(args.output_dir, "aligned_object.glb"),
+        transform_mode="bake",
+    )
+    save_aligned_glb(
+        str(loader.glb_path),
+        ref_pcd,
+        pose,
+        scale,
+        os.path.join(args.output_dir, "aligned_object_node.glb"),
+        transform_mode="node",
     )
 
     for cam_data in camera_data_list:
@@ -2458,6 +2627,145 @@ def run_pipeline(args):
         vis_script = os.path.join(os.path.dirname(__file__), "Obj_Step3_visualize_pose_result.py")
         subprocess.run([sys.executable, vis_script])
     print("=" * 60)
+    return {
+        "pose": pose,
+        "scale": scale,
+        "output_dir": args.output_dir,
+        "frame_id": args.frame_id,
+    }
+
+
+def run_auto_best_frame(args):
+    available_ids = list_available_frame_ids(args.data_dir)
+    if not available_ids:
+        raise RuntimeError("자동 프레임 탐색 실패: object_capture/cam0에서 프레임을 찾지 못했습니다.")
+
+    target_ids = parse_frame_search_spec(args.frame_search, available_ids)
+    if not target_ids:
+        raise RuntimeError("자동 프레임 탐색 실패: --frame_search로 지정된 프레임이 없습니다.")
+
+    print("=" * 60)
+    print(" 자동 프레임 탐색 (auto_best)")
+    print("=" * 60)
+    print(f"  탐색 프레임: {target_ids}")
+
+    base_output = args.output_dir
+    per_frame_root = os.path.join(base_output, "frames")
+    os.makedirs(per_frame_root, exist_ok=True)
+    all_results = []
+
+    for fid in target_ids:
+        print("\n" + "-" * 60)
+        print(f"[AUTO] frame {fid} 실행")
+        print("-" * 60)
+        sub_args = argparse.Namespace(**vars(args))
+        sub_args.frame_mode = "single"
+        sub_args.frame_id = fid
+        sub_args.output_dir = os.path.join(per_frame_root, fid)
+        try:
+            res = run_pipeline(sub_args)
+            pose = res["pose"]
+            conf = identity_confidence_score(pose)
+            all_results.append({
+                "frame_id": fid,
+                "status": "ok",
+                "confidence": conf,
+                "pose": pose,
+                "output_dir": sub_args.output_dir,
+            })
+            print(
+                f"[AUTO] frame {fid} 성공  "
+                f"conf={conf:.6f}  fit={pose.fitness:.4f} cov={pose.coverage:.4f}  "
+                f"obs={pose.observation_score:.3f} mesh={pose.mesh_render_score:.3f} desc={pose.descriptor_score:.3f}"
+            )
+            if getattr(args, "auto_stop_on_first", False):
+                break
+        except Exception as exc:
+            all_results.append({
+                "frame_id": fid,
+                "status": "fail",
+                "error": str(exc),
+                "output_dir": sub_args.output_dir,
+            })
+            print(f"[AUTO] frame {fid} 실패: {exc}")
+
+    ok_results = [r for r in all_results if r["status"] == "ok"]
+    best = max(ok_results, key=lambda r: r["confidence"]) if ok_results else None
+    final_dir = base_output
+    os.makedirs(final_dir, exist_ok=True)
+
+    if best is not None:
+        best_dir = best["output_dir"]
+        copy_names = [
+            "aligned_object.glb",
+            "aligned_object_node.glb",
+            "object_pose_sim.json",
+            "pose_Reference_Matching.npz",
+            "alignment_result.ply",
+            "object_pointcloud.ply",
+            "objects_no_table.ply",
+            "scene_merged.ply",
+            "reprojection_cam0.png",
+            "reprojection_cam1.png",
+            "reprojection_cam2.png",
+        ]
+        for name in copy_names:
+            src = os.path.join(best_dir, name)
+            dst = os.path.join(final_dir, name)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+
+    summary = {
+        "mode": "auto_best",
+        "selected_frame": best["frame_id"] if best is not None else None,
+        "selected_confidence": best["confidence"] if best is not None else None,
+        "status": "ok" if best is not None else "no_match",
+        "results": [],
+    }
+    for r in all_results:
+        item = {
+            "frame_id": r["frame_id"],
+            "status": r["status"],
+            "output_dir": r["output_dir"],
+        }
+        if r["status"] == "ok":
+            p = r["pose"]
+            item.update({
+                "confidence": r["confidence"],
+                "fitness": p.fitness,
+                "coverage": p.coverage,
+                "edge_cost_px": p.edge_cost_px,
+                "observation_score": p.observation_score,
+                "mesh_render_score": p.mesh_render_score,
+                "descriptor_score": p.descriptor_score,
+            })
+        else:
+            item["error"] = r.get("error", "")
+        summary["results"].append(item)
+
+    summary_path = os.path.join(final_dir, "auto_frame_selection.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    print("\n" + "=" * 60)
+    print("[AUTO] 실행 요약")
+    print("=" * 60)
+    if best is not None:
+        best_dir = best["output_dir"]
+        print(f"  선택 프레임: {best['frame_id']}")
+        print(f"  confidence: {best['confidence']:.6f}")
+        print(f"  원본 결과 위치: {best_dir}")
+    else:
+        print("  선택 프레임: 없음 (strict identity 통과 실패)")
+    print(f"  최종 결과 위치: {final_dir}")
+    print(f"  요약 저장: {summary_path}")
+    print("=" * 60)
+    return {
+        "selected_frame": best["frame_id"] if best is not None else None,
+        "confidence": best["confidence"] if best is not None else None,
+        "summary_path": summary_path,
+        "output_dir": final_dir,
+    }
 
 
 # =============================================================================
@@ -2477,6 +2785,12 @@ if __name__ == "__main__":
     parser.add_argument("--extrinsics_dir", default=_default_ext, help="외부 파라미터 디렉토리")
     parser.add_argument("--glb_path", default=_default_glb, help="GLB 모델 경로")
     parser.add_argument("--frame_id", default="000003", help="프레임 번호 (예: 000003)")
+    parser.add_argument("--frame_mode", choices=["single", "auto_best"], default="single",
+                        help="single: 단일 프레임 실행, auto_best: 여러 프레임 중 최고 신뢰 결과 선택")
+    parser.add_argument("--frame_search", type=str, default=None,
+                        help="auto_best 탐색 프레임 (예: 000000-000005 또는 000000,000003,000005)")
+    parser.add_argument("--auto_stop_on_first", action="store_true",
+                        help="auto_best에서 첫 성공 프레임 발견 즉시 중단")
     parser.add_argument("--num_cameras", type=int, default=3, help="카메라 수")
     parser.add_argument("--voxel_size", type=float, default=0.003, help="복셀 크기 (m)")
     parser.add_argument("--visualize", action="store_true", help="완료 후 시각화 자동 실행")
@@ -2531,4 +2845,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    run_pipeline(args)
+    if args.frame_mode == "auto_best":
+        run_auto_best_frame(args)
+    else:
+        run_pipeline(args)
