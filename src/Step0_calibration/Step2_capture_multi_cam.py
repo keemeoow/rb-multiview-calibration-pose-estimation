@@ -2,6 +2,14 @@
 # 멀티캠 캡처 (Step4까지 할 거면 depth 저장 필수)
 
 """
+[최소 마커 인식 1개 이상]
+python Step2_capture_multi_cam.py \
+  --root_folder ./data/cube_session_01 \
+  --intrinsics_dir ./intrinsics \
+  --fps 15 --width 640 --height 480 \
+  --min_markers 1 \
+  --show
+
 python Step2_capture_multi_cam.py \
   --root_folder ./data/cube_session_01 \
   --intrinsics_dir ./intrinsics \
@@ -12,14 +20,6 @@ python Step2_capture_multi_cam.py \
   --show
 """
 
-"""python Step2_capture_multi_cam.py \
-  --root_folder ./data/cube_session_01 \
-  --intrinsics_dir ./intrinsics \
-  --fps 15 --width 640 --height 480 \
-  --min_markers 1 \
-  --show
-"""
-
 import os
 import json
 import time
@@ -27,9 +27,17 @@ import argparse
 from typing import Dict
 
 import cv2
+import sys
 
-from src3._camera import RealSenseCamera
-from src3._aruco_cube import CubeConfig, ArucoCubeTarget
+# Allow running this script from inside src/Step0_calibration by adding the
+# repository root (parent of `src`) to sys.path so `import src...` works.
+THIS_DIR = os.path.dirname(__file__)
+REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from src._camera import RealSenseCamera
+from _aruco_cube import CubeConfig, ArucoCubeTarget
 
 
 def ensure_dir(p: str) -> str:

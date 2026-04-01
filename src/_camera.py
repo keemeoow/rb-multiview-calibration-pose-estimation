@@ -202,23 +202,35 @@ class RealSenseCamera:
                     frames = self.align.process(frames)
 
                 color = frames.get_color_frame() if self.use_color else None
-                depth = frames.get_depth_frame() if self.use_depth else None
+                if self.use_depth:
+                    depth = frames.get_depth_frame()
+                    if not depth:
+                        depth = frames.first_or_default(rs.stream.depth)
+                else:
+                    depth = None
 
-                if self.use_color and (color is None):
+                if self.use_color and not color:
                     continue
 
                 ts_ms = None
-                if color is not None:
+                if color:
                     ts_ms = float(color.get_timestamp())
-                elif depth is not None:
+                elif depth:
                     ts_ms = float(depth.get_timestamp())
+
+                depth_arr = None
+                if depth:
+                    try:
+                        depth_arr = np.asanyarray(depth.get_data()).copy()
+                    except Exception as de:
+                        print(f"[RS][WARN] serial={self.serial} depth.get_data() failed: {de}")
 
                 with self._lock:
                     prev_ts_ms = self._ts_ms
-                    if color is not None:
+                    if color:
                         self._color = np.asanyarray(color.get_data()).copy()
-                    if depth is not None:
-                        self._depth = np.asanyarray(depth.get_data()).copy()
+                    if depth_arr is not None:
+                        self._depth = depth_arr
                     self._ts_ms = ts_ms
                     self._frames_received += 1
                     if (prev_ts_ms is not None) and (ts_ms is not None) and (float(prev_ts_ms) == float(ts_ms)):

@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D          # noqa: F401
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from src3._aruco_cube import CubeConfig, ArucoCubeModel, ArucoCubeTarget
+from _aruco_cube import CubeConfig, ArucoCubeModel, ArucoCubeTarget
 
 
 CAM_COLORS = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple"]

@@ -238,6 +238,53 @@ class PointCloudProcessor:
         return pcd
 
     @staticmethod
+    def roi_3d_from_cam0(
+        depth_img: np.ndarray, K: np.ndarray, depth_scale: float,
+        roi: Tuple[int, int, int, int], margin: float = 0.03,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """cam0 픽셀 ROI → 3D AABB. depth histogram으로 foreground peak만 사용."""
+        x1, y1, x2, y2 = roi
+        h, w = depth_img.shape[:2]
+        x1, x2 = int(np.clip(x1, 0, w - 1)), int(np.clip(x2, 0, w - 1))
+        y1, y2 = int(np.clip(y1, 0, h - 1)), int(np.clip(y2, 0, h - 1))
+        patch = depth_img[y1:y2, x1:x2].astype(np.float64) * depth_scale
+        z_vals = patch[patch > 0.05].ravel()
+        if len(z_vals) == 0:
+            raise RuntimeError("ROI 내에 유효한 depth 값이 없습니다.")
+
+        # histogram으로 foreground depth peak 찾기
+        counts, edges = np.histogram(z_vals, bins=100)
+        peak_bin = np.argmax(counts)
+        z_peak = (edges[peak_bin] + edges[peak_bin + 1]) / 2.0
+        # peak ± 10cm만 사용 (배경 제거)
+        z_min_fg = z_peak - 0.10
+        z_max_fg = z_peak + 0.10
+
+        ys, xs = np.where((patch > z_min_fg) & (patch < z_max_fg))
+        if len(ys) == 0:
+            raise RuntimeError("ROI foreground depth 추출 실패.")
+
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        z = patch[ys, xs]
+        x3d = (xs + x1 - cx) * z / fx
+        y3d = (ys + y1 - cy) * z / fy
+        pts = np.stack([x3d, y3d, z], axis=-1)
+        mn = pts.min(axis=0) - margin
+        mx = pts.max(axis=0) + margin
+        print(f"[ROI] depth peak={z_peak:.3f}m, 사용 범위={z_min_fg:.3f}~{z_max_fg:.3f}m")
+        return mn, mx
+
+    @staticmethod
+    def filter_by_3d_box(
+        pcd: o3d.geometry.PointCloud,
+        min_xyz: np.ndarray, max_xyz: np.ndarray,
+    ) -> o3d.geometry.PointCloud:
+        """3D AABB(cam0 좌표계)로 점군 필터링."""
+        pts = np.asarray(pcd.points)
+        mask = np.all((pts >= min_xyz) & (pts <= max_xyz), axis=1)
+        return pcd.select_by_index(np.where(mask)[0])
+
+    @staticmethod
     def merge_pointclouds(
         camera_data_list: list, voxel_size: float = 0.002,
     ) -> o3d.geometry.PointCloud:
@@ -403,238 +450,373 @@ class PoseEstimator:
         ref_pcd: o3d.geometry.PointCloud,
         voxel_size: float = 0.005,
         table_plane: Optional[np.ndarray] = None,
+        object_size_m: Optional[float] = None,
+        direct_match: bool = False,  # kept for API compat, ignored
     ) -> Tuple[PoseResult, o3d.geometry.PointCloud, float]:
         """
-        색상 기반 클러스터 식별 → PCA 축 정렬 → ICP 정밀 정합.
-        table_plane: [a,b,c,d] 테이블 평면 (법선은 카메라쪽). 모델 상하 판별에 사용.
-        Returns: (PoseResult, aligned_model_pcd, scale)
+        1) GLB를 실제 크기로 스케일링 (object_size_m 또는 클러스터 자동 추정)
+        2) 크기가 가장 비슷한 DBSCAN 클러스터 자동 선택
+        3) Centroid 초기화 + PCA 후보 ICP
+        4) 누적 변환 올바르게 적용
         """
         print("\n" + "=" * 60)
-        print("[포즈 추정] 색상 식별 + PCA 정렬 + ICP 정합")
+        print("[포즈 추정] 크기 기반 자동 클러스터 선택 + ICP")
         print("=" * 60)
 
+        # GLB 크기 + 형상 비율 계산
         ref_pts = np.asarray(ref_pcd.points)
         R_ref, ref_eig = PoseEstimator._pca_axes(ref_pts)
-        ref_ratios = np.sort(ref_eig / ref_eig.max())[::-1]
-        # PCA 최장축 기준 범위 (AABB보다 정확)
-        ref_centered = ref_pts - ref_pts.mean(axis=0)
-        ref_proj = ref_centered @ R_ref
-        ref_pca_extents = ref_proj.max(axis=0) - ref_proj.min(axis=0)
-        ref_longest = ref_pca_extents.max()
-        print(f"  레퍼런스: {len(ref_pts)} pts, PCA longest={ref_longest:.3f}m")
+        ref_proj = (ref_pts - ref_pts.mean(axis=0)) @ R_ref
+        ref_extents = ref_proj.max(axis=0) - ref_proj.min(axis=0)
+        ref_longest = ref_extents.max()
+        # PCA 고유값 비율 (형상 지문) — 정육면체는 ≈(1,1,1), 원통은 ≈(1,1,0.6)
+        ref_eig_sorted = np.sort(ref_eig / ref_eig.max())[::-1]
+        print(f"  GLB: {len(ref_pts)} pts, longest={ref_longest:.3f}m  "
+              f"PCA비율={np.round(ref_eig_sorted, 2)}")
+
+        # 실제 크기 기준 균일 스케일 팩터
+        if object_size_m is not None:
+            fixed_scale = object_size_m / ref_longest
+            print(f"  스케일 고정: {fixed_scale:.4f}  ({object_size_m*100:.1f}cm)")
+        else:
+            fixed_scale = None
+
+        # GLB를 원점 중심으로 정규화
+        ref_center_local = ref_pts.mean(axis=0)
+        ref_pts_local = ref_pts - ref_center_local  # 원점 기준
+
+        def _make_scaled_pcd(s):
+            """GLB를 원점 기준 균일 스케일링한 pcd 반환."""
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(ref_pts_local * s)
+            if ref_pcd.has_colors():
+                pcd.colors = ref_pcd.colors
+            return pcd
+
+        def _run_icp(src, tgt, init_T, max_dist):
+            for p in [src, tgt]:
+                if not p.has_normals():
+                    p.estimate_normals(
+                        o3d.geometry.KDTreeSearchParamHybrid(radius=max_dist * 2, max_nn=30)
+                    )
+            return o3d.pipelines.registration.registration_icp(
+                src, tgt,
+                max_correspondence_distance=max_dist,
+                init=init_T,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                    relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=200,
+                ),
+            )
 
         # DBSCAN 클러스터링
         labels = np.array(objects_pcd.cluster_dbscan(
-            eps=0.015, min_points=50, print_progress=False
+            eps=0.012, min_points=30, print_progress=False
         ))
-        if len(labels) == 0 or labels.max() < 0:
-            raise RuntimeError("클러스터를 찾을 수 없습니다")
-
         unique_labels = np.unique(labels[labels >= 0])
-        print(f"  {len(unique_labels)}개 클러스터 발견")
+        print(f"  {len(unique_labels)}개 클러스터")
 
-        # 색상으로 대상 클러스터 식별
-        target_label, yellow_ratio = PoseEstimator._find_target_cluster(
-            objects_pcd, labels, unique_labels
-        )
-
-        if target_label >= 0 and yellow_ratio > 0.3:
-            candidate_labels = [target_label]
-            print(f"  색상 매칭: cluster {target_label} (yellow={yellow_ratio:.0%})")
-        else:
-            candidate_labels = [l for l in unique_labels
-                                if np.sum(labels == l) >= 100]
-            print(f"  색상 매칭 실패 → 전체 {len(candidate_labels)}개 탐색")
-
-        # 각 후보 클러스터에 대해 PCA 정렬 + ICP 시도
         best_score = -1
         best_result = None
 
-        for label in candidate_labels:
-            cluster_idx = np.where(labels == label)[0]
-            cluster = objects_pcd.select_by_index(cluster_idx)
-            cluster_pts = np.asarray(cluster.points)
-            R_cl, _ = PoseEstimator._pca_axes(cluster_pts)
-            cl_centered = cluster_pts - cluster_pts.mean(axis=0)
-            cl_proj = cl_centered @ R_cl
-            cl_pca_extents = cl_proj.max(axis=0) - cl_proj.min(axis=0)
-            cluster_longest = cl_pca_extents.max()
+        for label in unique_labels:
+            cl_idx = np.where(labels == label)[0]
+            if len(cl_idx) < 30:
+                continue
+            cluster = objects_pcd.select_by_index(cl_idx)
+            cl_pts = np.asarray(cluster.points)
 
-            # 스케일 추정 (PCA 최장축 기준)
-            scale = cluster_longest / ref_longest
-            if label == target_label:
-                if scale < 0.05 or scale > 0.5:
+            # 클러스터 크기 + 형상 비율 계산
+            R_cl, cl_eig = PoseEstimator._pca_axes(cl_pts)
+            cl_proj = (cl_pts - cl_pts.mean(axis=0)) @ R_cl
+            cl_extents = cl_proj.max(axis=0) - cl_proj.min(axis=0)
+            cl_longest = cl_extents.max()
+            cl_eig_sorted = np.sort(cl_eig / cl_eig.max())[::-1]
+            # GLB와 클러스터 형상 유사도 (1=완벽, 0=완전 다름)
+            shape_sim = float(1.0 - np.mean(np.abs(cl_eig_sorted - ref_eig_sorted)))
+
+            # 스케일 결정
+            if fixed_scale is not None:
+                s = fixed_scale
+                # 크기가 너무 다른 클러스터는 skip (실제 크기의 40~160% 범위)
+                ratio = cl_longest / object_size_m
+                if ratio < 0.4 or ratio > 1.6:
                     continue
             else:
-                if scale < 0.10 or scale > 0.30:
+                s = cl_longest / ref_longest
+                if s < 0.03 or s > 0.6:
                     continue
 
-            # 형상 유사도
-            _, cl_eig = PoseEstimator._pca_axes(cluster_pts)
-            cl_ratios = np.sort(cl_eig / cl_eig.max())[::-1]
-            shape_sim = 1.0 - np.mean(np.abs(cl_ratios - ref_ratios))
+            model_s = _make_scaled_pcd(s)
+            model_pts_s = np.asarray(model_s.points)  # 원점 기준
 
-            # 비균일 스케일링: PCA 축별로 클러스터에 맞춤
-            # ref 모델을 PCA 공간에서 축별 스케일 적용 후 다시 원래 공간으로
-            ref_center = ref_pts.mean(axis=0)
-            axis_scales = cl_pca_extents[np.argsort(cl_pca_extents)[::-1]] / \
-                          ref_pca_extents[np.argsort(ref_pca_extents)[::-1]]
-            # PCA 정렬 순서: 큰 축 → 작은 축
-            ref_sorted_idx = np.argsort(ref_pca_extents)[::-1]
-            S_pca = np.diag(axis_scales)  # PCA 공간에서의 스케일 행렬
-            # ref_pts → PCA → scale → back
-            ref_in_pca = (ref_pts - ref_center) @ R_ref
-            ref_scaled_pca = ref_in_pca @ S_pca
-            ref_scaled_pts = ref_scaled_pca @ R_ref.T + ref_center
+            # centroid 초기화: 모델을 클러스터 중심으로 이동
+            cl_center = cl_pts.mean(axis=0)
+            T_init = np.eye(4)
+            T_init[:3, 3] = cl_center  # 원점 → 클러스터 중심
 
-            model_scaled = o3d.geometry.PointCloud()
-            model_scaled.points = o3d.utility.Vector3dVector(ref_scaled_pts)
-            if ref_pcd.has_colors():
-                model_scaled.colors = ref_pcd.colors
-            print(f"      축별 스케일: ({axis_scales[0]:.4f}, {axis_scales[1]:.4f}, {axis_scales[2]:.4f})")
+            # PCA 4후보 (클러스터 중심 기준)
+            cand_Ts = PoseEstimator._pca_candidate_transforms(model_pts_s, cl_pts)
+            cand_Ts.append(T_init)  # centroid 후보도 포함
 
-            # FPFH 글로벌 정합 + PCA 4가지 조합 → 총 5개 초기 자세 후보
             cluster.estimate_normals(
                 o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3, max_nn=30)
             )
+            max_dist = max(voxel_size * 4, object_size_m * 0.3 if object_size_m else 0.02)
 
-            # FPFH 글로벌 정합 (PCA 축 모호성 없이 직접 매칭)
-            fpfh_result = PoseEstimator._fpfh_global_registration(
-                o3d.geometry.PointCloud(model_scaled), cluster, voxel_size
-            )
-            print(f"      FPFH: fitness={fpfh_result.fitness:.4f}, "
-                  f"rmse={fpfh_result.inlier_rmse:.6f}")
+            best_cand_score = -1
+            best_cand_T = T_init
+            best_cand_icp = None
+            for cand_T in cand_Ts:
+                mc = o3d.geometry.PointCloud(model_s)
+                mc.transform(cand_T)
+                res = _run_icp(mc, o3d.geometry.PointCloud(cluster), np.eye(4), max_dist)
+                if res.fitness > best_cand_score:
+                    best_cand_score = res.fitness
+                    best_cand_T = cand_T
+                    best_cand_icp = res
 
-            # PCA 4가지 + FPFH 1가지 = 5 후보
-            candidate_Ts = PoseEstimator._pca_candidate_transforms(
-                np.asarray(model_scaled.points), cluster_pts
-            )
-            # FPFH 결과를 추가 후보로
-            candidate_Ts.append(fpfh_result.transformation)
+            # shape_sim이 낮으면 형상이 GLB와 다른 물체 → 강하게 패널티
+            # ICP fitness만 보면 원통에도 높게 나오므로 shape_sim을 곱해서 필터링
+            combined_score = best_cand_score * (shape_sim ** 2)
 
-            best_orient_score = -1
-            best_orient_T = None
-            best_orient_icp = None
+            print(f"  cluster {label}: {len(cl_pts)}pts  longest={cl_longest*100:.1f}cm  "
+                  f"PCA비율={np.round(cl_eig_sorted,2)}  "
+                  f"shape={shape_sim:.3f}  ICP={best_cand_score:.4f}  score={combined_score:.4f}")
 
-            for ci, cand_T in enumerate(candidate_Ts):
-                model_cand = o3d.geometry.PointCloud(model_scaled)
-                model_cand.transform(cand_T)
-                model_cand.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3, max_nn=30)
-                )
-
-                icp_result = o3d.pipelines.registration.registration_icp(
-                    model_cand, cluster,
-                    max_correspondence_distance=voxel_size * 3,
-                    init=np.eye(4),
-                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                    criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                        relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=200,
-                    ),
-                )
-
-                orient_score = icp_result.fitness
-                tag = "FPFH" if ci == 4 else f"PCA{ci}"
-                print(f"      {tag}: fitness={icp_result.fitness:.4f}, "
-                      f"rmse={icp_result.inlier_rmse:.6f}")
-
-                if orient_score > best_orient_score:
-                    best_orient_score = orient_score
-                    best_orient_T = cand_T
-                    best_orient_icp = icp_result
-
-            # 색상 보너스
-            color_bonus = 0.0
-            if objects_pcd.has_colors():
-                cl_colors = np.asarray(objects_pcd.colors)[cluster_idx]
-                yellow = ((cl_colors[:, 0] > 0.4) &
-                          (cl_colors[:, 1] > 0.3) &
-                          (cl_colors[:, 2] < 0.35))
-                color_bonus = (yellow.sum() / len(cl_colors)) * 0.5
-
-            score = best_orient_icp.fitness * shape_sim + color_bonus
-
-            print(f"    cluster {label}: {len(cluster_pts)} pts, "
-                  f"scale={scale:.3f}, shape={shape_sim:.3f}, "
-                  f"ICP={best_orient_icp.fitness:.4f}, score={score:.4f}")
-
-            if score > best_score:
-                best_score = score
+            if combined_score > best_score:
+                best_score = combined_score
                 best_result = {
-                    "icp_T": best_orient_icp.transformation,
-                    "init_T": best_orient_T,
-                    "scale": scale,
-                    "model_scaled": model_scaled,
+                    "model_s": model_s,
+                    "cand_T": best_cand_T,
+                    "icp_res": best_cand_icp,
                     "cluster": cluster,
-                    "label": label,
+                    "scale": s,
+                    "cl_center": cl_center,
                 }
 
         if best_result is None:
-            raise RuntimeError("매칭 가능한 클러스터를 찾지 못했습니다")
+            raise RuntimeError("매칭 가능한 클러스터를 찾지 못했습니다. "
+                               "--object_size_m 범위를 확인하세요.")
 
-        # 최적 클러스터에 정밀 ICP
-        print(f"\n  최적: cluster {best_result['label']}, "
-              f"scale={best_result['scale']:.4f}, score={best_score:.4f}")
+        # 최적 클러스터로 정밀 ICP
+        model_s = best_result["model_s"]
+        cluster = best_result["cluster"]
+        cand_T = best_result["cand_T"]
+        icp0 = best_result["icp_res"]
+        max_dist = max(voxel_size * 4, object_size_m * 0.3 if object_size_m else 0.02)
 
-        model_final = o3d.geometry.PointCloud(best_result["model_scaled"])
-        model_final.transform(best_result["init_T"])
+        model_after_cand = o3d.geometry.PointCloud(model_s)
+        model_after_cand.transform(cand_T)
+        fine = _run_icp(model_after_cand, o3d.geometry.PointCloud(cluster),
+                        icp0.transformation, max_dist)
+        print(f"\n  정밀 ICP: fitness={fine.fitness:.4f}  RMSE={fine.inlier_rmse:.6f}")
 
-        for p in [model_final, best_result["cluster"]]:
-            p.estimate_normals(
-                o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
-            )
+        # 누적 변환: T_fine @ T_cand (model_s 원점 기준)
+        T_total = np.array(fine.transformation) @ cand_T
 
-        fine_result = o3d.pipelines.registration.registration_icp(
-            model_final, best_result["cluster"],
-            max_correspondence_distance=voxel_size * 3,
-            init=best_result["icp_T"],
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=300,
-            ),
-        )
-        print(f"  정밀 ICP: fitness={fine_result.fitness:.4f}, "
-              f"RMSE={fine_result.inlier_rmse:.6f}")
-
-        # 최종 정합 모델 생성
-        model_aligned = o3d.geometry.PointCloud(model_final)
-        model_aligned.transform(fine_result.transformation)
-
-        # 테이블 위 보정: 모델 하단이 테이블 평면에 닿도록 이동
-        if table_plane is not None:
-            aligned_pts = np.asarray(model_aligned.points)
-            normal = table_plane[:3]
-            signed_dists = aligned_pts @ normal + table_plane[3]
-            min_dist = signed_dists.min()
-            if min_dist > 0.001:
-                shift = -normal * min_dist
-                aligned_pts += shift
-                model_aligned.points = o3d.utility.Vector3dVector(aligned_pts)
-                print(f"  테이블 보정: {min_dist:.4f}m → 하단을 테이블에 맞춤")
-
+        # centroid fallback: fitness 너무 낮으면 centroid만 적용
+        model_aligned = _make_scaled_pcd(best_result["scale"])
+        if fine.fitness < 0.05:
+            print("  [경고] ICP fitness 낮음 → centroid 정렬만 적용")
+            T_total = np.eye(4)
+            T_total[:3, 3] = best_result["cl_center"]
+        model_aligned.transform(T_total)
         model_aligned.paint_uniform_color([1.0, 0.0, 0.0])
 
-        # PoseResult 생성
-        T = fine_result.transformation
-        R = T[:3, :3]
-        t = T[:3, 3]
+        # Pose 추출
+        R = T_total[:3, :3].copy()
+        U, _, Vt = np.linalg.svd(R)
+        R = (U @ Vt).copy()
+        t = np.asarray(model_aligned.points).mean(axis=0).copy()
         rot = Rotation.from_matrix(R)
+        T_out = np.eye(4)
+        T_out[:3, :3] = R
+        T_out[:3, 3] = t
 
         pose = PoseResult(
             translation=t,
             rotation_matrix=R,
             euler_xyz_deg=rot.as_euler("xyz", degrees=True),
             quaternion_xyzw=rot.as_quat(),
-            transform_4x4=T.copy(),
-            fitness=fine_result.fitness,
-            rmse=fine_result.inlier_rmse,
+            transform_4x4=T_out,
+            fitness=fine.fitness,
+            rmse=fine.inlier_rmse,
             method="Reference Matching",
         )
+        print(f"  위치: {np.round(t, 4)} m  회전: {np.round(rot.as_euler('xyz', degrees=True), 1)} deg")
         return pose, model_aligned, best_result["scale"]
 
 
 # =============================================================================
-# 5. 재투영 검증
+# 5. 2D 엣지 기반 포즈 정밀화
+# =============================================================================
+
+class PoseRefiner2D:
+    """
+    ICP 결과를 이미지 엣지에 맞춰 정밀화.
+    - 위치 탐색 범위: ICP 결과 ±search_r (기본 3cm)
+    - 회전 탐색 범위: ICP 결과 ±rot_deg (기본 30°)
+    """
+
+    @staticmethod
+    def refine(
+        model_pcd: o3d.geometry.PointCloud,
+        pose_init: "PoseResult",
+        camera_data_list: list,
+        n_samples: int = 2000,
+        n_iter: int = 800,
+        search_r: float = 0.05,    # 위치 탐색 반경 (m)
+        rot_deg: float = 40.0,     # 회전 탐색 범위 (deg)
+        output_dir: Optional[str] = None,
+    ) -> Tuple["PoseResult", o3d.geometry.PointCloud]:
+        from scipy.optimize import minimize
+
+        print("\n" + "=" * 60)
+        print("[2D 정밀화] GLB → 이미지 엣지 직접 정합")
+        print("=" * 60)
+
+        all_pts = np.asarray(model_pcd.points).astype(np.float64)
+        rng = np.random.default_rng(0)
+        idx = rng.choice(len(all_pts), min(n_samples, len(all_pts)), replace=False)
+        pts = all_pts[idx]
+        centroid0 = pts.mean(axis=0).copy()
+        pts_local = pts - centroid0  # 크기·형상 고정, 원점 기준
+
+        # 엣지 거리맵 (카메라별)
+        dist_maps, inv_T_list, K_list, img_shapes = [], [], [], []
+        for cam_data in camera_data_list:
+            gray = cv2.cvtColor(cam_data.color_img, cv2.COLOR_RGB2GRAY)
+            blur = cv2.GaussianBlur(gray, (7, 7), 1.5)
+            edges = cv2.Canny(blur, 30, 90)
+            edges = cv2.dilate(edges, np.ones((7, 7), np.uint8), iterations=3)
+            dist = cv2.distanceTransform(255 - edges, cv2.DIST_L2, 5)
+            dist_maps.append(dist.astype(np.float32))
+            inv_T_list.append(np.linalg.inv(cam_data.T_to_cam0).astype(np.float64))
+            K_list.append(cam_data.intrinsics.K.astype(np.float64))
+            img_shapes.append(cam_data.color_img.shape[:2])
+
+        rv0 = Rotation.from_matrix(pose_init.rotation_matrix).as_rotvec()
+        rot_bound = np.deg2rad(rot_deg)
+
+        # 파라미터: delta_rotvec(3) + delta_t(3) — ICP 결과 기준 상대값
+        def _cost(delta):
+            try:
+                rv = rv0 + delta[:3]
+                t  = centroid0 + delta[3:6]
+                R  = Rotation.from_rotvec(rv).as_matrix()
+                pts_c0 = pts_local @ R.T + t
+                pts_h  = np.hstack([pts_c0, np.ones((len(pts_c0), 1))])
+                total = 0.0
+                for inv_T, K, dm, (h, w) in zip(inv_T_list, K_list, dist_maps, img_shapes):
+                    pc = (inv_T @ pts_h.T)[:3].T
+                    valid = pc[:, 2] > 0.05
+                    if valid.sum() < 10:
+                        return 1e6
+                    p = pc[valid]
+                    u = (K[0, 0] * p[:, 0] / p[:, 2] + K[0, 2]).astype(np.int32)
+                    v = (K[1, 1] * p[:, 1] / p[:, 2] + K[1, 2]).astype(np.int32)
+                    ok = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+                    if ok.sum() < 10:
+                        return 1e6
+                    total += float(dm[v[ok], u[ok]].mean())
+                return total / len(dist_maps)
+            except Exception:
+                return 1e6
+
+        x0 = np.zeros(6)
+        c0 = _cost(x0)
+        print(f"  초기 cost={c0:.3f}  centroid={np.round(centroid0, 3)}")
+
+        # 탐색 범위 제한 (bounds)
+        b_t = search_r
+        b_r = rot_bound
+        bounds = [(-b_r, b_r)] * 3 + [(-b_t, b_t)] * 3
+
+        result = minimize(_cost, x0, method="L-BFGS-B", bounds=bounds,
+                          options={"maxiter": n_iter, "ftol": 1e-5, "gtol": 1e-5})
+        c1 = result.fun
+        print(f"  최종 cost={c1:.3f}  (iter={result.nit})")
+
+        if c1 >= c0 * 0.98:
+            print("  [경고] 유의미한 개선 없음 → ICP 결과 유지")
+            return pose_init, model_pcd
+
+        # 결과 적용
+        rv_opt = rv0 + result.x[:3]
+        t_opt  = centroid0 + result.x[3:6]
+        R_raw  = Rotation.from_rotvec(rv_opt).as_matrix()
+        U, _, Vt = np.linalg.svd(R_raw)
+        R_opt  = (U @ Vt).copy()
+
+        new_pts = pts_local @ R_opt.T + t_opt  # 샘플링된 점
+        all_local = all_pts - centroid0
+        all_new = all_local @ R_opt.T + t_opt  # 전체 점
+
+        new_pcd = o3d.geometry.PointCloud()
+        new_pcd.points = o3d.utility.Vector3dVector(all_new)
+        new_pcd.paint_uniform_color([1.0, 0.0, 0.0])
+
+        rot_obj = Rotation.from_matrix(R_opt)
+        T_out = np.eye(4)
+        T_out[:3, :3] = R_opt
+        T_out[:3, 3] = t_opt
+        new_pose = PoseResult(
+            translation=t_opt.copy(),
+            rotation_matrix=R_opt,
+            euler_xyz_deg=rot_obj.as_euler("xyz", degrees=True),
+            quaternion_xyzw=rot_obj.as_quat(),
+            transform_4x4=T_out,
+            fitness=pose_init.fitness,
+            rmse=pose_init.rmse,
+            method="Reference Matching + 2D Refinement",
+        )
+        print(f"  정밀화 위치: {np.round(t_opt, 4)} m  "
+              f"이동: {np.round(result.x[3:6]*100, 2)} cm  "
+              f"회전 보정: {np.round(np.rad2deg(result.x[:3]), 1)} deg")
+
+        if output_dir is not None:
+            PoseRefiner2D._save_debug(all_new, camera_data_list, dist_maps,
+                                      inv_T_list, K_list, output_dir)
+        return new_pose, new_pcd
+
+    @staticmethod
+    def _save_debug(pts_cam0, camera_data_list, dist_maps, inv_T_list, K_list, output_dir):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        pts_h = np.hstack([pts_cam0, np.ones((len(pts_cam0), 1))])
+        for i, (cam_data, inv_T, K, dm) in enumerate(
+                zip(camera_data_list, inv_T_list, K_list, dist_maps)):
+            pc = (inv_T @ pts_h.T)[:3].T
+            valid = pc[:, 2] > 0.05
+            if valid.sum() == 0:
+                continue
+            p = pc[valid]
+            u = (K[0, 0] * p[:, 0] / p[:, 2] + K[0, 2]).astype(np.int32)
+            v = (K[1, 1] * p[:, 1] / p[:, 2] + K[1, 2]).astype(np.int32)
+            h, w = cam_data.color_img.shape[:2]
+            ok = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            axes[0].imshow(cam_data.color_img)
+            axes[0].scatter(u[ok], v[ok], c="lime", s=2, alpha=0.6)
+            axes[0].set_title(f"cam{i} — 2D 정밀화")
+            axes[0].axis("off")
+            axes[1].imshow((dm < 5).astype(np.uint8) * 255, cmap="gray")
+            axes[1].scatter(u[ok], v[ok], c="red", s=2, alpha=0.6)
+            axes[1].set_title(f"cam{i} — 엣지맵")
+            axes[1].axis("off")
+            plt.tight_layout()
+            out = os.path.join(output_dir, f"refine2d_cam{i}.png")
+            plt.savefig(out, dpi=150)
+            plt.close()
+            print(f"  [2D 디버그] {out}")
+
+
+# =============================================================================
+# 7. 재투영 검증
 # =============================================================================
 
 class PoseValidator:
@@ -825,12 +1007,23 @@ def run_pipeline(args):
         os.path.join(args.output_dir, "objects_no_table.ply"), objects_pcd
     )
 
-    # --- 레퍼런스 매칭 포즈 추정 ---
+    # --- 포즈 추정 (크기 기반 자동 클러스터 선택 + ICP) ---
     print("\n[4/5] 포즈 추정")
     ref_pcd = loader.load_reference_pcd()
     pose, model_aligned, scale = PoseEstimator.estimate_pose(
         objects_pcd, ref_pcd, voxel_size=args.voxel_size,
         table_plane=table_plane,
+        object_size_m=getattr(args, "object_size_m", None),
+    )
+    print_pose(pose)
+
+    # --- 2D 엣지 정밀화 ---
+    print("\n[4.5/5] 2D 엣지 정밀화")
+    pose, model_aligned = PoseRefiner2D.refine(
+        model_aligned, pose, camera_data_list,
+        n_samples=2000,
+        n_iter=getattr(args, "refine_2d_iter", 800),
+        output_dir=args.output_dir,
     )
     print_pose(pose)
 
@@ -888,6 +1081,14 @@ if __name__ == "__main__":
     parser.add_argument("--num_cameras", type=int, default=3, help="카메라 수")
     parser.add_argument("--voxel_size", type=float, default=0.003, help="복셀 크기 (m)")
     parser.add_argument("--visualize", action="store_true", help="완료 후 시각화 자동 실행")
+    parser.add_argument("--roi_interactive", action="store_true",
+                        help="cam0 이미지에서 마우스로 ROI 선택")
+    parser.add_argument("--roi", type=str, default=None,
+                        help="ROI 픽셀 좌표 (cam0 기준): x1,y1,x2,y2")
+    parser.add_argument("--object_size_m", type=float, default=None,
+                        help="물체 실제 최장변 길이(m). 지정 시 스케일 고정 (예: 0.05 = 5cm)")
+    parser.add_argument("--refine_2d_iter", type=int, default=800,
+                        help="2D 엣지 정밀화 최대 반복 횟수 (기본 800)")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

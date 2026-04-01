@@ -19,7 +19,9 @@ from typing import Dict
 import cv2
 import numpy as np
 
-from src3._camera import RealSenseCamera
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+from src._camera import RealSenseCamera
 
 
 def ensure_dir(p: str) -> str:

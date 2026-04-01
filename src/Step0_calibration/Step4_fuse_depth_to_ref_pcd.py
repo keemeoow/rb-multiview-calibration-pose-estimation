@@ -85,10 +85,10 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 # open3d 는 선택적 의존성; 없어도 PLY 저장 + matplotlib로 대체
 
-from src3._aruco_cube import CubeConfig, ArucoCubeModel, ArucoCubeTarget, rodrigues_to_Rt
+from _aruco_cube import CubeConfig, ArucoCubeModel, ArucoCubeTarget, rodrigues_to_Rt
 
 try:
-    from src3._utils_pose import robust_se3_average
+    from _utils_pose import robust_se3_average
 except Exception:
     robust_se3_average = None
 
