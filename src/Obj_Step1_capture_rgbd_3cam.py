@@ -3,7 +3,7 @@
 #
 # 사용법:
 #   python capture_rgbd_3cam.py --save_dir ./data/object_capture
-#   python capture_rgbd_3cam.py --save_dir ./data/object_capture --intrinsics_dir ./data/_intrinsics
+#   python Obj_Step1_capture_rgbd_3cam.py --save_dir ./data/object_capture --intrinsics_dir ./data/_intrinsics
 #
 # 조작:
 #   SPACE : 현재 프레임 저장

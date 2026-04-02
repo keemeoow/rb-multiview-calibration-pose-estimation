@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
 [peg & hole 물체 포즈 추정]
+
+# 자동 스케일 (GLB 크기 → 클러스터 크기에 자동 맞춤)
 python3 src/Obj_Step2_multiview_pose_estimation.py \
   --data_dir src/data \
-  --output_dir src/output/strict_run \
+  --output_dir src/output/hole_run \
   --glb_path src/data/Hole.glb \
-  --frame_id 000003 \
-  --object_size_m 0.051 \
-  --no_refine_2d
+  --frame_id 000000
+
+# 수동 스케일 지정 (더 안정적)
+python3 src/Obj_Step2_multiview_pose_estimation.py \
+  --data_dir src/data \
+  --output_dir src/output/hole_run \
+  --glb_path src/data/Hole.glb \
+  --frame_id 000000 \
+  --object_size_m 0.051
 
 """
 
@@ -875,16 +883,13 @@ class PoseEstimator:
         ref_desc = PoseEstimator._shape_descriptor(ref_pts)
         print(f"  GLB: {len(ref_pts)} pts, longest={ref_longest:.3f}m  "
               f"PCA비율={np.round(ref_eig_sorted, 2)}")
-        if object_size_m is None and ref_longest > 0.20:
-            print("  [경고] GLB 단위가 실제보다 크게 보입니다. "
-                  "--object_size_m 지정이 훨씬 안정적입니다.")
-
         # 실제 크기 기준 균일 스케일 팩터
         if object_size_m is not None:
             fixed_scale = object_size_m / ref_longest
             print(f"  스케일 고정: {fixed_scale:.4f}  ({object_size_m*100:.1f}cm)")
         else:
-            fixed_scale = None
+            fixed_scale = None  # 클러스터별 자동 스케일 (cl_longest / ref_longest)
+            print(f"  스케일 자동: 각 클러스터 크기에 맞춰 GLB를 자동 스케일링")
 
         # GLB를 원점 중심으로 정규화
         ref_center_local = ref_pts.mean(axis=0)
@@ -948,13 +953,13 @@ class PoseEstimator:
             # 스케일 결정
             if fixed_scale is not None:
                 s = fixed_scale
-                # 실제 깊이 노이즈와 멀티뷰 병합 오차를 고려해 허용 범위를 넓게 둔다.
                 ratio = cl_longest / object_size_m
                 if ratio < 0.3 or ratio > 2.2:
                     continue
             else:
+                # 자동: GLB를 클러스터 크기에 맞게 스케일링
                 s = cl_longest / ref_longest
-                if s < 0.02 or s > 0.8:
+                if s < 0.005 or s > 50.0:
                     continue
 
             model_s = _make_scaled_pcd(s)
@@ -983,7 +988,8 @@ class PoseEstimator:
             cluster.estimate_normals(
                 o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3, max_nn=30)
             )
-            max_dist = max(voxel_size * 4, object_size_m * 0.3 if object_size_m else 0.02)
+            effective_size = object_size_m if object_size_m else cl_longest
+            max_dist = max(voxel_size * 4, effective_size * 0.3)
 
             best_cand_score = -1
             best_cand_T = T_init
@@ -1065,20 +1071,23 @@ class PoseEstimator:
                     "cluster": cluster,
                     "scale": s,
                     "cl_center": cl_center,
+                    "cl_longest": cl_longest,
                     "edge_cost": edge_cost,
                     "desc_sim": desc_sim,
                 }
 
         if best_result is None:
             raise RuntimeError("매칭 가능한 클러스터를 찾지 못했습니다. "
-                               "--object_size_m 범위를 확인하세요.")
+                               "ROI나 프레임을 변경해 보세요.")
 
         # 최적 클러스터로 정밀 ICP (Multi-scale + Visible Surface)
         model_s = best_result["model_s"]
         cluster = best_result["cluster"]
         cand_T = best_result["cand_T"]
         icp0 = best_result["icp_res"]
-        base_dist = max(voxel_size * 2.5, object_size_m * 0.10 if object_size_m else 0.008)
+        best_cl_longest = best_result.get("cl_longest", 0.05)
+        effective_size2 = object_size_m if object_size_m else best_cl_longest
+        base_dist = max(voxel_size * 2.5, effective_size2 * 0.10)
 
         model_after_cand = o3d.geometry.PointCloud(model_s)
         model_after_cand.transform(cand_T)
