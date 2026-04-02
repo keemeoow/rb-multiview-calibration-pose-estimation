@@ -102,11 +102,11 @@ python Obj_Step1_capture_rgbd_3cam.py \
 
 1. `cam0/1/2` RGB-D + intrinsics + extrinsics 로드
 2. 각 카메라 depth를 점군화하고 `cam0` 좌표계로 통합
-3. RANSAC으로 테이블 평면 제거
-4. DBSCAN으로 클러스터링, 색상 기반(노란색) 타겟 클러스터 우선 선택
-5. 레퍼런스 모델(Ply/Glb)을 PCA 축 기반 비균일 스케일링
-6. 초기정렬 5후보(PCA 4개 + FPFH 1개) 생성 후 ICP
-7. 정밀 ICP + 테이블 접지 보정으로 최종 6DoF 산출
+3. RANSAC으로 테이블 평면 제거 + 높이 필터
+4. 필요 시 ROI 또는 자동 proposal로 물체 후보 crop
+5. 레퍼런스 모델(GLB/PLY)을 자동 중심/스케일 준비 후 multi-scale `FPFH + ICP` 정합
+6. 멀티뷰 depth consistency와 coverage score로 최종 포즈/스케일 선택
+7. Isaac Sim용 pose/JSON/aligned GLB 저장
 8. 각 카메라로 재투영 이미지 생성
 
 좌표계:
@@ -147,6 +147,10 @@ python Obj_Step2_multiview_pose_estimation.py --visualize
 
 - `--num_cameras` (기본 3)
 - `--voxel_size` (기본 `0.003` m)
+- `--roi`, `--roi_interactive`: cam0 기준 ROI 지정
+- 물체의 실측 크기를 따로 넣지 않아도 depth 기반으로 자동 스케일을 추정
+- `--disable_auto_detect`: 자동 proposal 없이 전체 물체 점군에 직접 정합
+- `--frame_mode auto_best`: 여러 프레임 중 최고 신뢰 결과 선택
 - `--visualize`: 포즈 추정 완료 후 `Obj_Step3_visualize_pose_result.py` 자동 실행
 
 ### 3-3. 결과값

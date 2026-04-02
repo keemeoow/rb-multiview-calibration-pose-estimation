@@ -1,0 +1,52 @@
+{
+  "mode": "auto_best",
+  "selected_frame": "000000",
+  "selected_confidence": 0.22180990463191727,
+  "status": "ok",
+  "results": [
+    {
+      "frame_id": "000000",
+      "status": "ok",
+      "output_dir": "src/output_hole_best/frames/000000",
+      "confidence": 0.22180990463191727,
+      "score": 0.22180990463191727,
+      "depth_score": 0.38387509390290947,
+      "coverage": 0.5778179104477612,
+      "fitness": 1.0,
+      "rmse": 0.00808523064574284
+    },
+    {
+      "frame_id": "000001",
+      "status": "ok",
+      "output_dir": "src/output_hole_best/frames/000001",
+      "confidence": 0.21510582643714593,
+      "score": 0.21510582643714593,
+      "depth_score": 0.39225843292409346,
+      "coverage": 0.5483778253883235,
+      "fitness": 1.0,
+      "rmse": 0.008771969361297621
+    },
+    {
+      "frame_id": "000002",
+      "status": "ok",
+      "output_dir": "src/output_hole_best/frames/000002",
+      "confidence": 0.18232113087806417,
+      "score": 0.18232113087806417,
+      "depth_score": 0.3557585351244973,
+      "coverage": 0.5124856127886324,
+      "fitness": 1.0,
+      "rmse": 0.008291269389619197
+    },
+    {
+      "frame_id": "000003",
+      "status": "ok",
+      "output_dir": "src/output_hole_best/frames/000003",
+      "confidence": 0.17724650264002703,
+      "score": 0.17801195404240938,
+      "depth_score": 0.3615781025597702,
+      "coverage": 0.4923195093457944,
+      "fitness": 0.9957,
+      "rmse": 0.009135388114986811
+    }
+  ]
+}
