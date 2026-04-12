@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+if [[ -f "$HOME/.bashrc" ]]; then
+    source "$HOME/.bashrc"
+elif [[ -f "$HOME/.bash_profile" ]]; then
+    source "$HOME/.bash_profile"
+fi
+
+__project_rc_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export PROJECT_WORKSPACE_FOLDER="$(cd -- "$__project_rc_dir/.." && pwd)"
+
+if [[ -f "$PROJECT_WORKSPACE_FOLDER/scripts/terminal_logging.sh" ]]; then
+    source "$PROJECT_WORKSPACE_FOLDER/scripts/terminal_logging.sh"
+fi
+
+unset __project_rc_dir

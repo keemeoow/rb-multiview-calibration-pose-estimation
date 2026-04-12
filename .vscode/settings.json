@@ -1,0 +1,25 @@
+{
+  "terminal.integrated.enablePersistentSessions": false,
+  "terminal.integrated.profiles.linux": {
+    "Project Bash": {
+      "path": "/bin/bash",
+      "args": [
+        "--rcfile",
+        "${workspaceFolder}/.vscode/bashrc.project",
+        "-i"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.linux": "Project Bash",
+  "terminal.integrated.profiles.osx": {
+    "Project Bash": {
+      "path": "/bin/bash",
+      "args": [
+        "--rcfile",
+        "${workspaceFolder}/.vscode/bashrc.project",
+        "-i"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.osx": "Project Bash"
+}

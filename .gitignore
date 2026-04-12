@@ -12,3 +12,6 @@ src/checkpoints/
 
 # OS files
 .DS_Store
+
+# Terminal logs
+logs/terminal/*.txt
