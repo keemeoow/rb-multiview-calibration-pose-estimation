@@ -1,79 +1,36 @@
 #!/usr/bin/env python3
 """
-[peg & hole 물체 포즈 추정]
+멀티뷰 RGB-D 기반 물체 포즈 추정 파이프라인.
 
-# 자동 스케일 (GLB 크기 → 클러스터 크기에 자동 맞춤)
-python3 src/Obj_Step2_multiview_pose_estimation.py \
-  --data_dir src/data \
-  --output_dir src/output/hole_run \
-  --glb_path src/data/Hole.glb \
-  --frame_id 000000
+목표:
+  - Step2의 편한 입출력/자동 proposal 흐름은 유지
+  - 포즈 정합 백엔드는 Obj_pose_estimator.py 스타일의
+    multi-scale FPFH + ICP + multiview depth / coverage 스코어로 단순화
+  - 입력으로는 calibrated multiview RGB-D와 unscaled reference GLB만 사용
+  - Isaac Sim에 바로 넣을 수 있는 aligned GLB / pose npz / json 출력
 
-# 수동 스케일 지정 (더 안정적)
-python3 src/Obj_Step2_multiview_pose_estimation.py \
-  --data_dir src/data \
-  --output_dir src/output/hole_run \
-  --glb_path src/data/Hole.glb \
-  --frame_id 000000 \
-  --object_size_m 0.051
-
-"""
-
-"""
-=============================================================================
-멀티뷰 RGB-D 카메라 기반 물체 6DoF 포즈 추정
-=============================================================================
-
-[원리]
-  1) 3대의 RGB-D 카메라(cam0/1/2)의 내부 파라미터(K, D, depth_scale)와
-     외부 파라미터(T_C0_C1, T_C0_C2)를 이용해 각 카메라의 RGB-D 점군을
-     cam0 좌표계로 통합(merge)한다.
-  2) RANSAC으로 테이블 평면을 제거하여 물체 후보만 남긴다.
-  3) DBSCAN 클러스터링 후, 물체 고유 색상(예: 노란색)을 기준으로
-     대상 클러스터를 식별한다.
-  4) 레퍼런스 3D 모델(PLY/GLB)과 식별된 클러스터 사이에서:
-     - PCA 주축 정렬로 초기 자세를 추정하고
-     - ICP(Point-to-Plane)로 정밀 정합하여 최종 6DoF 포즈를 얻는다.
-  5) 정합 결과를 각 카메라 이미지에 재투영(reprojection)하여 시각 검증한다.
-
-[데이터 구조]
-  src3/data/
-  ├── _intrinsics/
-  │   ├── cam0.npz           # color_K, color_D, depth_scale_m_per_unit
-  │   ├── cam1.npz
-  │   └── cam2.npz
-  ├── cube_session_01/
-  │   └── calib_out_cube/
-  │       ├── T_C0_C1.npy    # 4x4 cam1→cam0 변환행렬
-  │       └── T_C0_C2.npy    # 4x4 cam2→cam0 변환행렬
-  ├── object_capture/
-  │   ├── cam0/              # rgb_NNNNNN.jpg, depth_NNNNNN.png
-  │   ├── cam1/
-  │   └── cam2/
-  ├── reference_knife.ply    # 레퍼런스 3D 모델 (점군)
-  └── reference_knife.glb    # 레퍼런스 3D 모델 (메시, PLY 없을 때 대체)
-
-[설치]
-  pip install numpy opencv-python open3d trimesh scipy matplotlib
-
-[사용법]
-  python3 src3/multiview_pose_estimation.py --visualize
-  python3 src3/multiview_pose_estimation.py --frame_id 000005
-  python3 src3/multiview_pose_estimation.py --data_dir ./custom_data
+예시:
+  python3 src/Obj_Step2_multiview_pose_estimation.py \
+    --data_dir src/data \
+    --output_dir src/output/hole_run \
+    --glb_path src/data/Hole.glb \
+    --frame_id 000000
 """
 
 import argparse
-import sys
-import os
+import itertools
 import json
+import os
 import shutil
+import subprocess
+import sys
 import warnings
-from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import cv2
+import numpy as np
 
 warnings.filterwarnings("ignore")
 
@@ -87,19 +44,19 @@ try:
 except ImportError:
     sys.exit("[ERROR] trimesh 설치 필요: pip install trimesh")
 
-from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 
 # =============================================================================
-# 1. 데이터 클래스
+# Data classes
 # =============================================================================
+
 
 @dataclass
 class CameraIntrinsics:
-    K: np.ndarray           # 3x3 내부 행렬
-    D: np.ndarray           # 왜곡 계수
-    depth_scale: float      # depth → 미터
+    K: np.ndarray
+    D: np.ndarray
+    depth_scale: float
     cam_id: int = 0
 
 
@@ -113,19 +70,18 @@ class CameraData:
 
 @dataclass
 class PoseResult:
-    translation: np.ndarray     # [x, y, z] (m)
-    rotation_matrix: np.ndarray # 3x3
-    euler_xyz_deg: np.ndarray   # [rx, ry, rz] (deg)
-    quaternion_xyzw: np.ndarray # [x, y, z, w]
-    transform_4x4: np.ndarray  # 4x4
-    fitness: float = 0.0
+    translation: np.ndarray
+    rotation_matrix: np.ndarray
+    euler_xyz_deg: np.ndarray
+    quaternion_xyzw: np.ndarray
+    transform_4x4: np.ndarray
+    scale: float = 1.0
+    score: float = 0.0
+    depth_score: float = 0.0
     coverage: float = 0.0
+    fitness: float = 0.0
     rmse: float = 0.0
-    edge_cost_px: float = 0.0
-    observation_score: float = 0.0
-    mesh_render_score: float = 0.0
-    descriptor_score: float = 0.0
-    method: str = ""
+    method: str = "Reference Matching"
 
 
 @dataclass
@@ -140,14 +96,29 @@ class DetectionProposal:
     score: float
 
 
+@dataclass
+class PreparedReference:
+    pcd: o3d.geometry.PointCloud
+    mesh: Optional[trimesh.Trimesh]
+    original_center: np.ndarray
+    original_longest_m: float
+    prep_scale: float
+    estimated_size_m: Optional[float] = None
+
+
 # =============================================================================
-# 2. 데이터 로드
+# Data loading
 # =============================================================================
 
+
 class DataLoader:
-    def __init__(self, data_dir: str, frame_id: str = "000003",
-                 extrinsics_dir: Optional[str] = None,
-                 glb_path: Optional[str] = None):
+    def __init__(
+        self,
+        data_dir: str,
+        frame_id: str = "000003",
+        extrinsics_dir: Optional[str] = None,
+        glb_path: Optional[str] = None,
+    ):
         self.data_dir = Path(data_dir)
         self.intrinsics_dir = self.data_dir / "_intrinsics"
         if not self.intrinsics_dir.exists():
@@ -174,11 +145,9 @@ class DataLoader:
             raise FileNotFoundError(f"캘리브레이션 파일 없음: {npz_path}")
 
         data = np.load(str(npz_path), allow_pickle=True)
-        K = self._get_key(data, ["color_K", "K", "camera_matrix"])
-        D = self._get_key(data, ["color_D", "D", "dist_coeffs"])
-        depth_scale = float(
-            self._get_key(data, ["depth_scale_m_per_unit", "depth_scale"])
-        )
+        K = self._get_key(data, ["color_K", "K", "camera_matrix"]).astype(np.float64)
+        D = self._get_key(data, ["color_D", "D", "dist_coeffs"]).astype(np.float64)
+        depth_scale = float(self._get_key(data, ["depth_scale_m_per_unit", "depth_scale"]))
         print(f"  [cam{cam_id}] K loaded, depth_scale={depth_scale:.6f}")
         return CameraIntrinsics(K=K, D=D, depth_scale=depth_scale, cam_id=cam_id)
 
@@ -187,8 +156,9 @@ class DataLoader:
         for name in ["T_C0_C1", "T_C0_C2"]:
             path = self.extrinsics_dir / f"{name}.npy"
             if path.exists():
-                T = np.load(str(path))
-                assert T.shape == (4, 4)
+                T = np.load(str(path)).astype(np.float64)
+                if T.shape != (4, 4):
+                    raise ValueError(f"외부 파라미터 shape 오류: {path} -> {T.shape}")
                 extrinsics[name] = T
                 print(f"  [{name}] 로드 완료")
             else:
@@ -205,10 +175,11 @@ class DataLoader:
         if not depth_path.exists():
             raise FileNotFoundError(f"깊이 이미지 없음: {depth_path}")
 
-        color_img = cv2.cvtColor(
-            cv2.imread(str(color_path), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB
-        )
+        color_bgr = cv2.imread(str(color_path), cv2.IMREAD_COLOR)
         depth_img = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if color_bgr is None or depth_img is None:
+            raise FileNotFoundError(f"이미지 로드 실패: cam{cam_id} frame {self.frame_id}")
+        color_img = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
         print(f"  [cam{cam_id}] color={color_img.shape}, depth={depth_img.shape}")
         return color_img, depth_img
 
@@ -220,23 +191,22 @@ class DataLoader:
             return pcd
 
         mesh = self.load_reference_mesh(print_info=False)
-        if mesh is not None:
-            pts, face_idx = trimesh.sample.sample_surface(mesh, 30000, seed=0)
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts)
-            # GLB 메시에서 색상 추출 (Colored ICP 지원)
-            try:
-                face_colors = mesh.visual.face_colors
-                if face_colors is not None and len(face_colors) > 0:
-                    colors = face_colors[face_idx][:, :3].astype(np.float64) / 255.0
-                    if np.std(colors) > 0.01:
-                        pcd.colors = o3d.utility.Vector3dVector(colors)
-            except Exception:
-                pass
-            print(f"  [REF] GLB → 점군: {len(pts)} pts")
-            return pcd
+        if mesh is None:
+            raise FileNotFoundError("레퍼런스 모델 없음 (PLY/GLB)")
 
-        raise FileNotFoundError("레퍼런스 모델 없음 (PLY/GLB)")
+        pts, face_idx = trimesh.sample.sample_surface(mesh, 30000, seed=0)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        try:
+            face_colors = mesh.visual.face_colors
+            if face_colors is not None and len(face_colors) > 0:
+                colors = face_colors[face_idx][:, :3].astype(np.float64) / 255.0
+                if np.std(colors) > 0.01:
+                    pcd.colors = o3d.utility.Vector3dVector(colors)
+        except Exception:
+            pass
+        print(f"  [REF] GLB -> 점군: {len(pts)} pts")
+        return pcd
 
     def load_reference_mesh(self, print_info: bool = True) -> Optional[trimesh.Trimesh]:
         if not self.glb_path.exists():
@@ -244,7 +214,10 @@ class DataLoader:
 
         scene_or_mesh = trimesh.load(str(self.glb_path), force="scene")
         if isinstance(scene_or_mesh, trimesh.Scene):
-            mesh = trimesh.util.concatenate(scene_or_mesh.dump())
+            geometries = [g.copy() for g in scene_or_mesh.geometry.values()]
+            if not geometries:
+                return None
+            mesh = trimesh.util.concatenate(geometries)
         else:
             mesh = scene_or_mesh
 
@@ -261,16 +234,20 @@ class DataLoader:
 
 
 # =============================================================================
-# 3. 점군 처리
+# Point cloud processing
 # =============================================================================
 
-class PointCloudProcessor:
 
+class PointCloudProcessor:
     @staticmethod
     def depth_to_pointcloud(
-        color_img: np.ndarray, depth_img: np.ndarray,
-        K: np.ndarray, D: np.ndarray, depth_scale: float,
-        min_depth: float = 0.1, max_depth: float = 3.0,
+        color_img: np.ndarray,
+        depth_img: np.ndarray,
+        K: np.ndarray,
+        D: np.ndarray,
+        depth_scale: float,
+        min_depth: float = 0.1,
+        max_depth: float = 3.0,
     ) -> o3d.geometry.PointCloud:
         h, w = depth_img.shape[:2]
 
@@ -284,12 +261,11 @@ class PointCloudProcessor:
 
         u, v = np.meshgrid(np.arange(w), np.arange(h))
         fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-
         x = (u[valid] - cx) * z[valid] / fx
         y = (v[valid] - cy) * z[valid] / fy
         points = np.stack([x, y, z[valid]], axis=-1)
 
-        if len(color_img.shape) == 3:
+        if color_img.ndim == 3:
             colors = color_img[valid].astype(np.float64) / 255.0
         else:
             gray = color_img[valid].astype(np.float64) / 255.0
@@ -302,24 +278,26 @@ class PointCloudProcessor:
 
     @staticmethod
     def roi_3d_from_cam0(
-        depth_img: np.ndarray, K: np.ndarray, depth_scale: float,
-        roi: Tuple[int, int, int, int], margin: float = 0.03,
+        depth_img: np.ndarray,
+        K: np.ndarray,
+        depth_scale: float,
+        roi: Tuple[int, int, int, int],
+        margin: float = 0.03,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """cam0 픽셀 ROI → 3D AABB. depth histogram으로 foreground peak만 사용."""
         x1, y1, x2, y2 = roi
         h, w = depth_img.shape[:2]
-        x1, x2 = int(np.clip(x1, 0, w - 1)), int(np.clip(x2, 0, w - 1))
-        y1, y2 = int(np.clip(y1, 0, h - 1)), int(np.clip(y2, 0, h - 1))
+        x1 = int(np.clip(x1, 0, w - 1))
+        x2 = int(np.clip(x2, 0, w - 1))
+        y1 = int(np.clip(y1, 0, h - 1))
+        y2 = int(np.clip(y2, 0, h - 1))
         patch = depth_img[y1:y2, x1:x2].astype(np.float64) * depth_scale
         z_vals = patch[patch > 0.05].ravel()
         if len(z_vals) == 0:
             raise RuntimeError("ROI 내에 유효한 depth 값이 없습니다.")
 
-        # histogram으로 foreground depth peak 찾기
         counts, edges = np.histogram(z_vals, bins=100)
-        peak_bin = np.argmax(counts)
+        peak_bin = int(np.argmax(counts))
         z_peak = (edges[peak_bin] + edges[peak_bin + 1]) / 2.0
-        # peak ± 10cm만 사용 (배경 제거)
         z_min_fg = z_peak - 0.10
         z_max_fg = z_peak + 0.10
 
@@ -340,24 +318,27 @@ class PointCloudProcessor:
     @staticmethod
     def filter_by_3d_box(
         pcd: o3d.geometry.PointCloud,
-        min_xyz: np.ndarray, max_xyz: np.ndarray,
+        min_xyz: np.ndarray,
+        max_xyz: np.ndarray,
     ) -> o3d.geometry.PointCloud:
-        """3D AABB(cam0 좌표계)로 점군 필터링."""
         pts = np.asarray(pcd.points)
         mask = np.all((pts >= min_xyz) & (pts <= max_xyz), axis=1)
         return pcd.select_by_index(np.where(mask)[0])
 
     @staticmethod
     def merge_pointclouds(
-        camera_data_list: list, voxel_size: float = 0.002,
+        camera_data_list: list,
+        voxel_size: float = 0.002,
     ) -> o3d.geometry.PointCloud:
         merged = o3d.geometry.PointCloud()
-
         for cam_data in camera_data_list:
             intr = cam_data.intrinsics
             pcd = PointCloudProcessor.depth_to_pointcloud(
-                cam_data.color_img, cam_data.depth_img,
-                intr.K, intr.D, intr.depth_scale,
+                cam_data.color_img,
+                cam_data.depth_img,
+                intr.K,
+                intr.D,
+                intr.depth_scale,
             )
             pcd.transform(cam_data.T_to_cam0)
             print(f"  [cam{intr.cam_id}] {len(pcd.points)} pts")
@@ -366,33 +347,31 @@ class PointCloudProcessor:
         n_before = len(merged.points)
         merged = merged.voxel_down_sample(voxel_size=voxel_size)
         merged, _ = merged.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        print(f"  [통합] {n_before} → {len(merged.points)} pts (voxel={voxel_size}m)")
+        print(f"  [통합] {n_before} -> {len(merged.points)} pts (voxel={voxel_size}m)")
         return merged
 
     @staticmethod
     def remove_table_plane(
-        pcd: o3d.geometry.PointCloud, distance_threshold: float = 0.008,
+        pcd: o3d.geometry.PointCloud,
+        distance_threshold: float = 0.008,
     ) -> Tuple[o3d.geometry.PointCloud, np.ndarray]:
-        """테이블 평면 제거. Returns: (objects_pcd, plane_model [a,b,c,d])
-        plane_model: ax+by+cz+d=0, 법선 방향은 카메라(원점) 쪽."""
         plane_model, inliers = pcd.segment_plane(
-            distance_threshold=distance_threshold, ransac_n=3, num_iterations=1000
+            distance_threshold=distance_threshold,
+            ransac_n=3,
+            num_iterations=1000,
         )
         a, b, c, d = plane_model
         print(f"  평면: {a:.3f}x + {b:.3f}y + {c:.3f}z + {d:.3f} = 0")
 
         objects_pcd = pcd.select_by_index(inliers, invert=True)
-        objects_pcd, _ = objects_pcd.remove_statistical_outlier(
-            nb_neighbors=20, std_ratio=1.5
-        )
-        print(f"  평면 제거: {len(pcd.points)} → {len(objects_pcd.points)} pts")
+        objects_pcd, _ = objects_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.5)
+        print(f"  평면 제거: {len(pcd.points)} -> {len(objects_pcd.points)} pts")
 
-        # 법선이 카메라(원점) 쪽을 향하도록 방향 보정
-        plane_normal = np.array([a, b, c])
+        plane_normal = np.array([a, b, c], dtype=np.float64)
         plane_point = -d * plane_normal / np.dot(plane_normal, plane_normal)
         if np.dot(plane_normal, -plane_point) < 0:
             plane_model = [-a, -b, -c, -d]
-        return objects_pcd, np.array(plane_model)
+        return objects_pcd, np.array(plane_model, dtype=np.float64)
 
     @staticmethod
     def filter_by_plane_height(
@@ -401,7 +380,6 @@ class PointCloudProcessor:
         min_height: float = 0.002,
         max_height: float = 0.12,
     ) -> o3d.geometry.PointCloud:
-        """테이블 평면으로부터 일정 높이 범위의 점만 유지."""
         pts = np.asarray(pcd.points)
         if len(pts) == 0:
             return pcd
@@ -415,18 +393,18 @@ class PointCloudProcessor:
         keep = (signed_dist >= min_height) & (signed_dist <= max_height)
         filtered = pcd.select_by_index(np.where(keep)[0])
         print(
-            f"  높이 필터: {len(pcd.points)} → {len(filtered.points)} pts  "
+            f"  높이 필터: {len(pcd.points)} -> {len(filtered.points)} pts  "
             f"({min_height*1000:.0f}~{max_height*1000:.0f} mm)"
         )
         return filtered
 
 
 # =============================================================================
-# 4. 자동 물체 후보 검출
+# Automatic object proposals
 # =============================================================================
 
-class AutomaticObjectDetector:
 
+class AutomaticObjectDetector:
     @staticmethod
     def detect_from_cam0(
         camera_data: CameraData,
@@ -472,9 +450,7 @@ class AutomaticObjectDetector:
 
         for label in range(1, n_labels):
             x0, y0, bw, bh, area = stats[label]
-            if area < min_area_px:
-                continue
-            if bw < 20 or bh < 20:
+            if area < min_area_px or bw < 20 or bh < 20:
                 continue
             if area > 0.20 * h * w:
                 continue
@@ -507,16 +483,18 @@ class AutomaticObjectDetector:
             occupancy = float(area) / max(float(bw * bh), 1.0)
             border_penalty = 0.7 if (x0 <= 2 or y0 <= 2 or (x0 + bw) >= (w - 2) or (y0 + bh) >= (h - 2)) else 1.0
             score = float(area) * occupancy * border_penalty
-            proposals.append(DetectionProposal(
-                proposal_id=proposal_id,
-                roi=(x1, y1, x2, y2),
-                min_xyz=min_xyz,
-                max_xyz=max_xyz,
-                area_px=int(area),
-                mean_height_m=float(np.median(comp_heights)),
-                depth_m=float(np.median(comp_depth)),
-                score=score,
-            ))
+            proposals.append(
+                DetectionProposal(
+                    proposal_id=proposal_id,
+                    roi=(x1, y1, x2, y2),
+                    min_xyz=min_xyz,
+                    max_xyz=max_xyz,
+                    area_px=int(area),
+                    mean_height_m=float(np.median(comp_heights)),
+                    depth_m=float(np.median(comp_depth)),
+                    score=score,
+                )
+            )
             proposal_id += 1
 
         proposals.sort(key=lambda p: p.score, reverse=True)
@@ -571,7 +549,7 @@ class AutomaticObjectDetector:
             hi = np.percentile(cl_pts, 95, axis=0)
             ext = hi - lo
             longest = float(np.max(ext))
-            if longest < 0.015 or longest > 0.18:
+            if longest < 0.015 or longest > 0.25:
                 continue
 
             valid = cl_pts[:, 2] > 0.05
@@ -605,16 +583,18 @@ class AutomaticObjectDetector:
             v_norm = float(np.mean(v_ok)) / max(float(h), 1.0)
             score = float(len(p_ok)) / max(depth_m ** 3, 1e-4)
             score *= (0.2 + 0.8 * np.clip(v_norm, 0.0, 1.0))
-            proposals.append(DetectionProposal(
-                proposal_id=proposal_id,
-                roi=(x1, y1, x2, y2),
-                min_xyz=min_xyz,
-                max_xyz=max_xyz,
-                area_px=roi_area,
-                mean_height_m=float(np.median(p_ok[:, 1])),
-                depth_m=depth_m,
-                score=score,
-            ))
+            proposals.append(
+                DetectionProposal(
+                    proposal_id=proposal_id,
+                    roi=(x1, y1, x2, y2),
+                    min_xyz=min_xyz,
+                    max_xyz=max_xyz,
+                    area_px=roi_area,
+                    mean_height_m=float(np.median(p_ok[:, 1])),
+                    depth_m=depth_m,
+                    score=score,
+                )
+            )
             proposal_id += 1
 
         proposals.sort(key=lambda p: p.score, reverse=True)
@@ -678,1306 +658,621 @@ class AutomaticObjectDetector:
 
 
 # =============================================================================
-# 4. 포즈 추정 (레퍼런스 모델 매칭)
+# Reference preparation
 # =============================================================================
 
-class PoseEstimator:
+
+class ReferencePreprocessor:
+    @staticmethod
+    def _robust_longest_extent(pts: np.ndarray, q_low: float = 15.0, q_high: float = 85.0) -> float:
+        pts = np.asarray(pts, dtype=np.float64)
+        if len(pts) == 0:
+            return 0.0
+        lo = np.percentile(pts, q_low, axis=0)
+        hi = np.percentile(pts, q_high, axis=0)
+        return float(np.max(hi - lo))
 
     @staticmethod
-    def _pca_axes(pts: np.ndarray):
-        """PCA 주축 반환 (3x3 열벡터, 큰 고유값 순)"""
-        cov = np.cov((pts - pts.mean(axis=0)).T)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        idx = np.argsort(eigenvalues)[::-1]
-        R = eigenvectors[:, idx]
+    def estimate_object_size_m(
+        objects_pcd: o3d.geometry.PointCloud,
+        proposals: Optional[list] = None,
+        q_low: float = 15.0,
+        q_high: float = 85.0,
+        top_k: int = 3,
+        min_points: int = 150,
+    ) -> Optional[float]:
+        size_candidates = []
+
+        if proposals:
+            for prop in proposals[:top_k]:
+                crop = PointCloudProcessor.filter_by_3d_box(objects_pcd, prop.min_xyz, prop.max_xyz)
+                pts = np.asarray(crop.points)
+                if len(pts) < min_points:
+                    continue
+                longest = ReferencePreprocessor._robust_longest_extent(pts, q_low=q_low, q_high=q_high)
+                if 0.01 <= longest <= 0.25:
+                    size_candidates.append(longest)
+
+        if not size_candidates:
+            pts = np.asarray(objects_pcd.points)
+            if len(pts) >= min_points:
+                longest = ReferencePreprocessor._robust_longest_extent(pts, q_low=20.0, q_high=80.0)
+                if 0.01 <= longest <= 0.25:
+                    size_candidates.append(longest)
+
+        if not size_candidates:
+            return None
+
+        return float(np.median(size_candidates))
+
+    @staticmethod
+    def prepare_reference(
+        ref_pcd: o3d.geometry.PointCloud,
+        ref_mesh: Optional[trimesh.Trimesh],
+        output_dir: Optional[str] = None,
+        target_size_m: Optional[float] = None,
+        save_glb: bool = True,
+    ) -> PreparedReference:
+        ref_pts = np.asarray(ref_pcd.points, dtype=np.float64)
+        if len(ref_pts) == 0:
+            raise RuntimeError("레퍼런스 점군이 비어 있어 자동 준비를 할 수 없습니다.")
+
+        center = ref_pts.mean(axis=0)
+        centered_pts = ref_pts - center
+        longest = float((centered_pts.max(axis=0) - centered_pts.min(axis=0)).max())
+        if longest < 1e-9:
+            raise RuntimeError("레퍼런스 모델 extent가 너무 작아 자동 준비를 할 수 없습니다.")
+
+        prep_scale = float(target_size_m / longest) if target_size_m is not None else 1.0
+
+        prepared_pcd = o3d.geometry.PointCloud()
+        prepared_pcd.points = o3d.utility.Vector3dVector(centered_pts * prep_scale)
+        if ref_pcd.has_colors():
+            prepared_pcd.colors = o3d.utility.Vector3dVector(np.asarray(ref_pcd.colors))
+
+        prepared_mesh = None
+        if ref_mesh is not None:
+            prepared_mesh = ref_mesh.copy()
+            center_T = np.eye(4)
+            center_T[:3, 3] = -center
+            scale_T = np.eye(4)
+            scale_T[:3, :3] *= prep_scale
+            prepared_mesh.apply_transform(scale_T @ center_T)
+
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
+            info = {
+                "estimated_size_m": None if target_size_m is None else float(target_size_m),
+                "original_longest_m": float(longest),
+                "prep_scale": float(prep_scale),
+                "prepared_longest_m": float(longest * prep_scale),
+                "center_shift_xyz_m": center.tolist(),
+            }
+            info_path = os.path.join(output_dir, "reference_prepared_info.json")
+            with open(info_path, "w") as f:
+                json.dump(info, f, indent=2, ensure_ascii=False)
+            print(f"  reference 준비 정보 저장: {info_path}")
+
+            if save_glb and prepared_mesh is not None:
+                prepared_glb_path = os.path.join(output_dir, "reference_prepared.glb")
+                trimesh.Scene(prepared_mesh).export(prepared_glb_path)
+                print(f"  자동 준비된 reference GLB 저장: {prepared_glb_path}")
+
+        return PreparedReference(
+            pcd=prepared_pcd,
+            mesh=prepared_mesh,
+            original_center=center,
+            original_longest_m=longest,
+            prep_scale=prep_scale,
+            estimated_size_m=target_size_m,
+        )
+
+
+# =============================================================================
+# Pose estimation backend
+# =============================================================================
+
+
+class PoseEstimator:
+    _ref_points_cache: Dict[Tuple[int, int, int], np.ndarray] = {}
+
+    @staticmethod
+    def _pca_axes(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        pts = np.asarray(pts, dtype=np.float64)
+        if len(pts) < 3:
+            return np.eye(3), np.ones(3)
+        c = pts - pts.mean(axis=0)
+        cov = c.T @ c / max(len(pts), 1)
+        vals, vecs = np.linalg.eigh(cov)
+        order = np.argsort(vals)[::-1]
+        R = vecs[:, order]
+        vals = vals[order]
         if np.linalg.det(R) < 0:
             R[:, 2] *= -1
-        return R, eigenvalues[idx]
+        return R, vals
 
     @staticmethod
-    def _shape_descriptor(pts: np.ndarray, n_r: int = 24, n_a: int = 16) -> np.ndarray:
-        """
-        간단한 회전-부호 강건 형상 서술자.
-        - PCA 정렬 후 robust scale 정규화
-        - 반경 분포 + 축 절대값 분포 히스토그램 결합
-        """
-        pts = np.asarray(pts, dtype=np.float64)
-        if len(pts) < 30:
-            return np.zeros(n_r + 3 * n_a, dtype=np.float64)
+    def _pca_rotation_candidates(src_pts: np.ndarray, tgt_pts: np.ndarray) -> List[np.ndarray]:
+        R_s, _ = PoseEstimator._pca_axes(src_pts)
+        R_t, _ = PoseEstimator._pca_axes(tgt_pts)
+        cands = []
+        for perm in itertools.permutations(range(3)):
+            for signs in itertools.product([1, -1], repeat=3):
+                R_p = np.zeros((3, 3))
+                for i in range(3):
+                    R_p[:, i] = signs[i] * R_s[:, perm[i]]
+                if np.linalg.det(R_p) < 0:
+                    continue
+                cands.append(R_t @ R_p.T)
+        cands.append(np.eye(3))
 
-        center = pts.mean(axis=0)
-        R, _ = PoseEstimator._pca_axes(pts)
-        proj = (pts - center) @ R
-        lo = np.percentile(proj, 5.0, axis=0)
-        hi = np.percentile(proj, 95.0, axis=0)
-        scale = float(np.max(hi - lo))
-        if scale < 1e-9:
-            return np.zeros(n_r + 3 * n_a, dtype=np.float64)
-
-        q = proj / scale
-        r = np.linalg.norm(q, axis=1)
-        a = np.abs(q)
-
-        r_bins = np.linspace(0.0, 1.8, n_r + 1)
-        a_bins = np.linspace(0.0, 1.0, n_a + 1)
-        h_r = np.histogram(np.clip(r, 0.0, 1.8), bins=r_bins)[0].astype(np.float64)
-        h_x = np.histogram(np.clip(a[:, 0], 0.0, 1.0), bins=a_bins)[0].astype(np.float64)
-        h_y = np.histogram(np.clip(a[:, 1], 0.0, 1.0), bins=a_bins)[0].astype(np.float64)
-        h_z = np.histogram(np.clip(a[:, 2], 0.0, 1.0), bins=a_bins)[0].astype(np.float64)
-        desc = np.concatenate([h_r, h_x, h_y, h_z], axis=0)
-        s = float(desc.sum())
-        if s > 0:
-            desc /= s
-        return desc
+        unique = [cands[0]]
+        for R in cands[1:]:
+            dup = False
+            for Ru in unique:
+                ang = np.arccos(np.clip((np.trace(R @ Ru.T) - 1.0) / 2.0, -1.0, 1.0))
+                if ang < np.radians(5.0):
+                    dup = True
+                    break
+            if not dup:
+                unique.append(R)
+        return unique
 
     @staticmethod
-    def _descriptor_similarity(desc_ref: np.ndarray, desc_query: np.ndarray) -> float:
-        if desc_ref is None or desc_query is None:
-            return 0.0
-        if len(desc_ref) != len(desc_query) or len(desc_ref) == 0:
-            return 0.0
-        # Histogram intersection in [0,1]
-        return float(np.minimum(desc_ref, desc_query).sum())
-
-    @staticmethod
-    def _pca_candidate_transforms_extended(src_pts, dst_pts):
-        """
-        PCA 축 부호 조합(4) × 축 순서 치환(3) + 주축 대칭 회전(3) = 총 15개 후보.
-        부분 관측 시 축 모호성과 대칭 물체의 회전 모호성 해소.
-        """
-        R_src, _ = PoseEstimator._pca_axes(src_pts)
-        R_dst, _ = PoseEstimator._pca_axes(dst_pts)
-        src_center = src_pts.mean(axis=0)
-        dst_center = dst_pts.mean(axis=0)
-
-        candidates = []
-        # 축 순서 치환: identity, (0↔1), (0↔2)
-        axis_perms = [[0, 1, 2], [1, 0, 2], [2, 1, 0]]
-        for perm in axis_perms:
-            R_src_perm = R_src[:, perm]
-            for s1 in [1, -1]:
-                for s2 in [1, -1]:
-                    R_flip = R_src_perm.copy()
-                    R_flip[:, 0] *= s1
-                    R_flip[:, 1] *= s2
-                    R_flip[:, 2] = np.cross(R_flip[:, 0], R_flip[:, 1])
-                    R_align = R_dst @ R_flip.T
-                    t = dst_center - R_align @ src_center
-                    T = np.eye(4)
-                    T[:3, :3] = R_align
-                    T[:3, 3] = t
-                    candidates.append(T)
-
-        # dst 주축 기준 90° 단위 대칭 회전 추가
-        base_R = R_dst @ R_src.T
-        for angle_deg in [90, 180, 270]:
-            rv = R_dst[:, 0] * np.deg2rad(angle_deg)
-            R_sym = Rotation.from_rotvec(rv).as_matrix()
-            R_align = R_sym @ base_R
-            t = dst_center - R_align @ src_center
+    def _pca_candidate_transforms(src_pts: np.ndarray, dst_pts: np.ndarray) -> List[np.ndarray]:
+        src_center = np.asarray(src_pts, dtype=np.float64).mean(axis=0)
+        dst_center = np.asarray(dst_pts, dtype=np.float64).mean(axis=0)
+        transforms = []
+        for R in PoseEstimator._pca_rotation_candidates(src_pts, dst_pts)[:4]:
             T = np.eye(4)
-            T[:3, :3] = R_align
-            T[:3, 3] = t
-            candidates.append(T)
-
-        return candidates
+            T[:3, :3] = R
+            T[:3, 3] = dst_center - R @ src_center
+            transforms.append(T)
+        return transforms
 
     @staticmethod
     def _fpfh_global_registration(source, target, voxel_size):
-        """FPFH 특징 기반 RANSAC 글로벌 정합. PCA 축 모호성 없이 직접 정합."""
         radius_normal = voxel_size * 3
-        radius_feature = voxel_size * 6
+        radius_feature = voxel_size * 5
 
-        # 법선 추정
-        source.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30)
-        )
-        target.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30)
-        )
+        for pcd in [source, target]:
+            pcd.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30)
+            )
 
-        # FPFH 특징 추출
         source_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
             source,
-            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100)
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100),
         )
         target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
             target,
-            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100)
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100),
         )
-
-        # RANSAC 글로벌 정합
-        result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-            source, target, source_fpfh, target_fpfh,
+        return o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+            source,
+            target,
+            source_fpfh,
+            target_fpfh,
             mutual_filter=True,
             max_correspondence_distance=voxel_size * 3,
             estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-            ransac_n=4,
+            ransac_n=3,
             checkers=[
                 o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
                 o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(voxel_size * 3),
             ],
-            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(4000000, 500),
+            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999),
         )
-        return result
 
     @staticmethod
-    def _visible_surface_filter(model_pcd, camera_data_list):
-        """카메라 시점에서 보이는 모델 표면만 추출 (Hidden Point Removal).
-        부분 관측 데이터와의 ICP 정확도를 높이기 위해 사용."""
-        all_visible = set()
-        diameter = np.linalg.norm(
-            model_pcd.get_max_bound() - model_pcd.get_min_bound()
-        )
-        if diameter < 1e-6:
-            return model_pcd
-        radius = diameter * 100
+    def _find_target_cluster(
+        objects_pcd: o3d.geometry.PointCloud,
+        labels: np.ndarray,
+        unique_labels: np.ndarray,
+    ) -> Tuple[int, float]:
+        if len(unique_labels) == 0:
+            return -1, 0.0
+        if not objects_pcd.has_colors():
+            counts = [(int(label), int(np.sum(labels == label))) for label in unique_labels]
+            counts.sort(key=lambda x: x[1], reverse=True)
+            return counts[0][0], 0.0
+
+        colors = np.asarray(objects_pcd.colors)
+        best_label = int(unique_labels[0])
+        best_ratio = 0.0
+        best_score = -1.0
+        for label in unique_labels:
+            mask = labels == label
+            cl_colors = colors[mask]
+            if len(cl_colors) == 0:
+                continue
+            yellow = (cl_colors[:, 0] > 0.55) & (cl_colors[:, 1] > 0.55) & (cl_colors[:, 2] < 0.45)
+            yellow_ratio = float(np.mean(yellow))
+            size_bonus = min(np.sum(mask) / 5000.0, 1.0) * 0.2
+            score = yellow_ratio + size_bonus
+            if score > best_score:
+                best_score = score
+                best_ratio = yellow_ratio
+                best_label = int(label)
+        return best_label, best_ratio
+
+    @staticmethod
+    def _reference_points(
+        ref_pcd: o3d.geometry.PointCloud,
+        ref_mesh: Optional[trimesh.Trimesh],
+        n_samples: int = 20000,
+    ) -> np.ndarray:
+        cache_key = (id(ref_pcd), id(ref_mesh), int(n_samples))
+        cached = PoseEstimator._ref_points_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        pts = np.asarray(ref_pcd.points, dtype=np.float64)
+        if len(pts) == 0 and ref_mesh is not None:
+            pts, _ = trimesh.sample.sample_surface(ref_mesh, n_samples, seed=0)
+            pts = np.asarray(pts, dtype=np.float64)
+
+        if len(pts) > n_samples:
+            rng = np.random.default_rng(0)
+            idx = rng.choice(len(pts), n_samples, replace=False)
+            pts = pts[idx]
+
+        PoseEstimator._ref_points_cache[cache_key] = pts
+        return pts
+
+    @staticmethod
+    def _multiview_depth_score(
+        model_pts_cam0: np.ndarray,
+        camera_data_list: list,
+        tol: float = 0.015,
+    ) -> float:
+        total_ok = 0
+        total_valid = 0
+        pts_h = np.hstack([model_pts_cam0, np.ones((len(model_pts_cam0), 1), dtype=np.float64)])
 
         for cam_data in camera_data_list:
-            cam_pos = cam_data.T_to_cam0[:3, 3].copy()
-            try:
-                _, pt_map = model_pcd.hidden_point_removal(cam_pos, radius)
-                all_visible.update(pt_map)
-            except Exception:
+            h, w = cam_data.depth_img.shape
+            T_inv = np.linalg.inv(cam_data.T_to_cam0)
+            pts_ci = (T_inv @ pts_h.T)[:3].T
+            front = pts_ci[:, 2] > 0.05
+            if front.sum() == 0:
                 continue
 
-        if len(all_visible) < 50:
-            return model_pcd
+            p = pts_ci[front]
+            K = cam_data.intrinsics.K
+            u = (K[0, 0] * p[:, 0] / p[:, 2] + K[0, 2]).astype(np.int32)
+            v = (K[1, 1] * p[:, 1] / p[:, 2] + K[1, 2]).astype(np.int32)
+            ok_uv = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+            if ok_uv.sum() == 0:
+                continue
 
-        return model_pcd.select_by_index(list(all_visible))
+            z_model = p[ok_uv, 2]
+            z_real = cam_data.depth_img[v[ok_uv], u[ok_uv]].astype(np.float64) * cam_data.intrinsics.depth_scale
+            has_d = z_real > 0.05
+            if has_d.sum() == 0:
+                continue
+
+            diff = np.abs(z_model[has_d] - z_real[has_d])
+            total_ok += int((diff < tol).sum())
+            total_valid += int(has_d.sum())
+
+        return float(total_ok) / max(float(total_valid), 1.0)
+
+    @staticmethod
+    def _coverage_score(
+        model_pts_cam0: np.ndarray,
+        obj_pcd: o3d.geometry.PointCloud,
+        radius: float = 0.005,
+    ) -> float:
+        obj_pts = np.asarray(obj_pcd.points)
+        if len(obj_pts) == 0 or len(model_pts_cam0) == 0:
+            return 0.0
+
+        model_pcd = o3d.geometry.PointCloud()
+        model_pcd.points = o3d.utility.Vector3dVector(model_pts_cam0)
+        fwd_dists = np.asarray(model_pcd.compute_point_cloud_distance(obj_pcd))
+        forward = float((fwd_dists < radius).sum()) / max(float(len(fwd_dists)), 1.0)
+
+        margin = radius * 5.0
+        lo = model_pts_cam0.min(axis=0) - margin
+        hi = model_pts_cam0.max(axis=0) + margin
+        in_box = np.all((obj_pts >= lo) & (obj_pts <= hi), axis=1)
+        n_inbox = int(in_box.sum())
+        if n_inbox < 10:
+            return forward * 0.01
+
+        inbox_pcd = o3d.geometry.PointCloud()
+        inbox_pcd.points = o3d.utility.Vector3dVector(obj_pts[in_box])
+        rev_dists = np.asarray(inbox_pcd.compute_point_cloud_distance(model_pcd))
+        reverse = float((rev_dists < radius).sum()) / max(float(len(rev_dists)), 1.0)
+        return forward * reverse
+
+    @staticmethod
+    def _scale_candidates(
+        ref_longest: float,
+        obj_extent: float,
+        object_size_m: Optional[float],
+        max_candidates: int = 8,
+        narrow_search: bool = False,
+    ) -> List[float]:
+        if ref_longest < 1e-9:
+            raise RuntimeError("레퍼런스 모델 extent가 너무 작습니다.")
+
+        if object_size_m is not None:
+            exact = object_size_m / ref_longest
+            return [float(exact)]
+
+        anchor = obj_extent / ref_longest if obj_extent > 1e-9 else 1.0
+        candidates = []
+        if narrow_search:
+            for mult in [0.75, 0.90, 1.00, 1.10, 1.25]:
+                candidates.append(anchor * mult)
+        else:
+            for mult in [0.55, 0.70, 0.85, 1.00, 1.15, 1.30, 1.50]:
+                candidates.append(anchor * mult)
+            for real_cm in [2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20]:
+                candidates.append((real_cm / 100.0) / ref_longest)
+
+        unique = []
+        for s in sorted(candidates, key=lambda x: abs(np.log(max(x, 1e-9) / max(anchor, 1e-9)))):
+            if s <= 0.001 or s > 100.0:
+                continue
+            if any(abs(np.log(s / u)) < 0.03 for u in unique):
+                continue
+            unique.append(float(s))
+            if len(unique) >= max_candidates:
+                break
+        return unique
 
     @staticmethod
     def estimate_pose(
         objects_pcd: o3d.geometry.PointCloud,
         ref_pcd: o3d.geometry.PointCloud,
-        voxel_size: float = 0.005,
+        voxel_size: float = 0.003,
         object_size_m: Optional[float] = None,
         camera_data_list: Optional[list] = None,
-        edge_context: Optional[Dict[str, list]] = None,
-        observation_context: Optional[Dict[str, list]] = None,
-        mesh_render_context: Optional[Dict[str, list]] = None,
+        ref_mesh: Optional[trimesh.Trimesh] = None,
+        ref_sample_points: int = 12000,
+        max_scale_candidates: int = 8,
+        max_pca_candidates: int = 8,
+        narrow_scale_search: bool = False,
     ) -> Tuple[PoseResult, o3d.geometry.PointCloud, float]:
-        """
-        1) GLB를 실제 크기로 스케일링 (object_size_m 또는 클러스터 자동 추정)
-        2) 크기가 가장 비슷한 DBSCAN 클러스터 자동 선택
-        3) Centroid 초기화 + PCA 후보 ICP
-        4) 누적 변환 올바르게 적용
-        """
+        if camera_data_list is None or len(camera_data_list) == 0:
+            raise RuntimeError("camera_data_list가 필요합니다.")
+
+        obj_pts = np.asarray(objects_pcd.points, dtype=np.float64)
+        if len(obj_pts) < 50:
+            raise RuntimeError("포즈 추정을 위한 물체 점군이 너무 적습니다.")
+
+        ref_pts = PoseEstimator._reference_points(ref_pcd, ref_mesh, n_samples=ref_sample_points)
+        if len(ref_pts) < 50:
+            raise RuntimeError("레퍼런스 점군이 너무 적습니다.")
+        ref_center = ref_pts.mean(axis=0)
+        ref_pts_local = ref_pts - ref_center
+        ref_longest = float((ref_pts_local.max(axis=0) - ref_pts_local.min(axis=0)).max())
+        obj_extent = float((obj_pts.max(axis=0) - obj_pts.min(axis=0)).max())
+
         print("\n" + "=" * 60)
-        print("[포즈 추정] 크기 기반 자동 클러스터 선택 + ICP")
+        print("[포즈 추정] Obj_pose_estimator 스타일 backend")
         print("=" * 60)
+        print(f"  REF pts={len(ref_pts_local)} longest={ref_longest:.4f}m")
+        print(f"  OBJ pts={len(obj_pts)} longest={obj_extent:.4f}m")
 
-        def _robust_extents(proj_pts, q_low=5.0, q_high=95.0):
-            lo = np.percentile(proj_pts, q_low, axis=0)
-            hi = np.percentile(proj_pts, q_high, axis=0)
-            return hi - lo
-
-        # GLB 크기 + 형상 비율 계산
-        ref_pts = np.asarray(ref_pcd.points)
-        R_ref, ref_eig = PoseEstimator._pca_axes(ref_pts)
-        ref_proj = (ref_pts - ref_pts.mean(axis=0)) @ R_ref
-        ref_extents = _robust_extents(ref_proj)
-        ref_longest = ref_extents.max()
-        # PCA 고유값 비율 (형상 지문) — 정육면체는 ≈(1,1,1), 원통은 ≈(1,1,0.6)
-        ref_eig_sorted = np.sort(ref_eig / ref_eig.max())[::-1]
-        ref_desc = PoseEstimator._shape_descriptor(ref_pts)
-        print(f"  GLB: {len(ref_pts)} pts, longest={ref_longest:.3f}m  "
-              f"PCA비율={np.round(ref_eig_sorted, 2)}")
-        # 실제 크기 기준 균일 스케일 팩터
+        scale_candidates = PoseEstimator._scale_candidates(
+            ref_longest,
+            obj_extent,
+            object_size_m,
+            max_candidates=max_scale_candidates,
+            narrow_search=narrow_scale_search,
+        )
         if object_size_m is not None:
-            fixed_scale = object_size_m / ref_longest
-            print(f"  스케일 고정: {fixed_scale:.4f}  ({object_size_m*100:.1f}cm)")
-        else:
-            fixed_scale = None  # 클러스터별 자동 스케일 (cl_longest / ref_longest)
-            print(f"  스케일 자동: 각 클러스터 크기에 맞춰 GLB를 자동 스케일링")
+            print(f"  스케일 고정: {object_size_m*100:.1f}cm")
+        print(f"  스케일 후보: {len(scale_candidates)}개")
 
-        # GLB를 원점 중심으로 정규화
-        ref_center_local = ref_pts.mean(axis=0)
-        ref_pts_local = ref_pts - ref_center_local  # 원점 기준
+        best = None
+        best_score = -1.0
 
-        def _make_scaled_pcd(s):
-            """GLB를 원점 기준 균일 스케일링한 pcd 반환."""
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(ref_pts_local * s)
-            if ref_pcd.has_colors():
-                pcd.colors = ref_pcd.colors
-            return pcd
+        for scale in scale_candidates:
+            scaled_pts = ref_pts_local * scale
+            src = o3d.geometry.PointCloud()
+            src.points = o3d.utility.Vector3dVector(scaled_pts)
+            real_size = max(ref_longest * scale, voxel_size * 4)
+            vx = max(voxel_size, real_size * 0.08)
 
-        def _run_icp(src, tgt, init_T, max_dist):
-            for p in [src, tgt]:
-                if not p.has_normals():
-                    p.estimate_normals(
-                        o3d.geometry.KDTreeSearchParamHybrid(radius=max_dist * 2, max_nn=30)
-                    )
-            return o3d.pipelines.registration.registration_icp(
-                src, tgt,
-                max_correspondence_distance=max_dist,
-                init=init_T,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=200,
-                ),
-            )
-
-        if edge_context is None and camera_data_list is not None and len(camera_data_list) > 0:
-            edge_context = PoseRefiner2D.build_edge_context(camera_data_list)
-
-        # DBSCAN 클러스터링
-        labels = np.array(objects_pcd.cluster_dbscan(
-            eps=0.012, min_points=30, print_progress=False
-        ))
-        unique_labels = np.unique(labels[labels >= 0])
-        print(f"  {len(unique_labels)}개 클러스터")
-
-        best_score = -1
-        best_result = None
-
-        for label in unique_labels:
-            cl_idx = np.where(labels == label)[0]
-            if len(cl_idx) < 30:
+            src_down = src.voxel_down_sample(vx)
+            tgt_down = objects_pcd.voxel_down_sample(vx)
+            if len(src_down.points) < 30 or len(tgt_down.points) < 30:
                 continue
-            cluster = objects_pcd.select_by_index(cl_idx)
-            cl_pts = np.asarray(cluster.points)
 
-            # 클러스터 크기 + 형상 비율 계산
-            R_cl, cl_eig = PoseEstimator._pca_axes(cl_pts)
-            cl_proj = (cl_pts - cl_pts.mean(axis=0)) @ R_cl
-            cl_extents = _robust_extents(cl_proj)
-            cl_longest = cl_extents.max()
-            cl_eig_sorted = np.sort(cl_eig / cl_eig.max())[::-1]
-            # GLB와 클러스터 형상 유사도 (1=완벽, 0=완전 다름)
-            shape_sim = float(1.0 - np.mean(np.abs(cl_eig_sorted - ref_eig_sorted)))
-            cl_desc = PoseEstimator._shape_descriptor(cl_pts)
-            desc_sim = PoseEstimator._descriptor_similarity(ref_desc, cl_desc)
-
-            # 스케일 결정
-            if fixed_scale is not None:
-                s = fixed_scale
-                ratio = cl_longest / object_size_m
-                if ratio < 0.3 or ratio > 2.2:
-                    continue
-            else:
-                # 자동: GLB를 클러스터 크기에 맞게 스케일링
-                s = cl_longest / ref_longest
-                if s < 0.005 or s > 50.0:
-                    continue
-
-            model_s = _make_scaled_pcd(s)
-            model_pts_s = np.asarray(model_s.points)  # 원점 기준
-
-            # centroid 초기화: 모델을 클러스터 중심으로 이동
-            cl_center = cl_pts.mean(axis=0)
-            T_init = np.eye(4)
-            T_init[:3, 3] = cl_center  # 원점 → 클러스터 중심
-
-            # PCA 확장 후보 (축 치환 + 대칭 회전) + FPFH 글로벌 정합
-            cand_Ts = PoseEstimator._pca_candidate_transforms_extended(model_pts_s, cl_pts)
-            cand_Ts.append(T_init)  # centroid 후보도 포함
             try:
-                fpfh_result = PoseEstimator._fpfh_global_registration(
-                    o3d.geometry.PointCloud(model_s),
-                    o3d.geometry.PointCloud(cluster),
-                    voxel_size,
+                ransac = PoseEstimator._fpfh_global_registration(
+                    o3d.geometry.PointCloud(src_down),
+                    o3d.geometry.PointCloud(tgt_down),
+                    vx,
                 )
-                if fpfh_result.fitness > 0.05:
-                    cand_Ts.append(np.array(fpfh_result.transformation))
-                    print(f"    FPFH 후보 추가 (fitness={fpfh_result.fitness:.3f})")
+                fpfh_T = np.asarray(ransac.transformation)
+                fpfh_ok = ransac.fitness > 0.05
             except Exception:
-                pass
+                fpfh_T = np.eye(4)
+                fpfh_ok = False
 
-            cluster.estimate_normals(
-                o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3, max_nn=30)
-            )
-            effective_size = object_size_m if object_size_m else cl_longest
-            max_dist = max(voxel_size * 4, effective_size * 0.3)
+            init_candidates = []
+            if fpfh_ok:
+                init_candidates.append(fpfh_T)
 
-            best_cand_score = -1
-            best_cand_T = T_init
-            best_cand_icp = None
-            for cand_T in cand_Ts:
-                mc = o3d.geometry.PointCloud(model_s)
-                mc.transform(cand_T)
-                res = _run_icp(mc, o3d.geometry.PointCloud(cluster), np.eye(4), max_dist)
-                if res.fitness > best_cand_score:
-                    best_cand_score = res.fitness
-                    best_cand_T = cand_T
-                    best_cand_icp = res
+            tgt_center = obj_pts.mean(axis=0)
+            src_center = scaled_pts.mean(axis=0)
+            for R in PoseEstimator._pca_rotation_candidates(scaled_pts, obj_pts)[:max_pca_candidates]:
+                T = np.eye(4)
+                T[:3, :3] = R
+                T[:3, 3] = tgt_center - R @ src_center
+                init_candidates.append(T)
 
-            # shape_sim이 낮으면 형상이 GLB와 다른 물체 → 강하게 패널티
-            # ICP fitness만 보면 원통에도 높게 나오므로 shape_sim을 곱해서 필터링
-            model_eval = None
-            edge_cost = None
-            edge_score = 1.0
-            if best_cand_icp is not None:
-                model_eval = o3d.geometry.PointCloud(model_s)
-                model_eval.transform(np.array(best_cand_icp.transformation) @ best_cand_T)
-            if edge_context is not None and model_eval is not None:
-                edge_cost, mean_vis = PoseRefiner2D.projection_edge_cost(
-                    np.asarray(model_eval.points), edge_context, sample_size=1500
-                )
-                edge_score = float(np.exp(-edge_cost / 10.0) * np.clip(mean_vis / 0.10, 0.2, 1.0))
-
-            obs_score = 1.0
-            obs_msg = ""
-            if observation_context is not None and model_eval is not None:
-                obs_score, obs_detail = PoseRefiner2D.projection_observation_score(
-                    np.asarray(model_eval.points), observation_context, sample_size=5000
-                )
-                obs_msg = (
-                    f"  obs={obs_score:.3f}"
-                    f" mask={obs_detail['mask']:.3f}"
-                    f" depth={obs_detail['depth']:.3f}"
-                )
-
-            mesh_score = 1.0
-            mesh_msg = ""
-            if mesh_render_context is not None and model_eval is not None:
-                T_eval = np.array(best_cand_icp.transformation) @ best_cand_T
-                mesh_score, mesh_detail = PoseRefiner2D.mesh_render_score(
-                    T_eval,
-                    s,
-                    mesh_render_context,
-                )
-                mesh_msg = (
-                    f"  mesh={mesh_score:.3f}"
-                    f" mIoU={mesh_detail['mask']:.3f}"
-                    f" mDepth={mesh_detail['depth']:.3f}"
-                )
-
-            combined_score = (
-                best_cand_score
-                * (shape_sim ** 2)
-                * ((0.20 + 0.80 * desc_sim) ** 2)
-                * edge_score
-                * ((0.20 + 0.80 * obs_score) ** 2)
-                * ((0.15 + 0.85 * mesh_score) ** 2)
+            max_dist = max(real_size * 0.5, voxel_size * 6.0)
+            tgt_n = o3d.geometry.PointCloud(objects_pcd)
+            tgt_n.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=max_dist, max_nn=30)
             )
 
-            edge_msg = ""
-            if edge_cost is not None:
-                edge_msg = f"  edge={edge_cost:.2f}px"
-            print(f"  cluster {label}: {len(cl_pts)}pts  longest={cl_longest*100:.1f}cm  "
-                  f"PCA비율={np.round(cl_eig_sorted,2)}  "
-                  f"shape={shape_sim:.3f} desc={desc_sim:.3f}  "
-                  f"ICP={best_cand_score:.4f}{edge_msg}{obs_msg}{mesh_msg}  "
-                  f"score={combined_score:.4f}")
-
-            if combined_score > best_score:
-                best_score = combined_score
-                best_result = {
-                    "model_s": model_s,
-                    "cand_T": best_cand_T,
-                    "icp_res": best_cand_icp,
-                    "cluster": cluster,
-                    "scale": s,
-                    "cl_center": cl_center,
-                    "cl_longest": cl_longest,
-                    "edge_cost": edge_cost,
-                    "desc_sim": desc_sim,
-                }
-
-        if best_result is None:
-            raise RuntimeError("매칭 가능한 클러스터를 찾지 못했습니다. "
-                               "ROI나 프레임을 변경해 보세요.")
-
-        # 최적 클러스터로 정밀 ICP (Multi-scale + Visible Surface)
-        model_s = best_result["model_s"]
-        cluster = best_result["cluster"]
-        cand_T = best_result["cand_T"]
-        icp0 = best_result["icp_res"]
-        best_cl_longest = best_result.get("cl_longest", 0.05)
-        effective_size2 = object_size_m if object_size_m else best_cl_longest
-        base_dist = max(voxel_size * 2.5, effective_size2 * 0.10)
-
-        model_after_cand = o3d.geometry.PointCloud(model_s)
-        model_after_cand.transform(cand_T)
-
-        # Visible surface filtering: ICP에 보이는 면만 사용
-        model_for_icp = model_after_cand
-        if camera_data_list:
-            model_visible = PoseEstimator._visible_surface_filter(
-                model_after_cand, camera_data_list
-            )
-            if len(model_visible.points) > 100:
-                model_for_icp = model_visible
-                print(f"  Visible surface: {len(model_after_cand.points)} → {len(model_visible.points)} pts")
-
-        # Multi-scale coarse-to-fine ICP
-        target_cluster = o3d.geometry.PointCloud(cluster)
-        for p in [model_for_icp, target_cluster]:
-            if not p.has_normals():
-                p.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(radius=base_dist * 4, max_nn=30)
+            best_local_fitness = -1.0
+            best_local_T = np.eye(4)
+            for T_init in init_candidates:
+                src_c = o3d.geometry.PointCloud(src)
+                src_c.transform(T_init)
+                src_c.estimate_normals(
+                    o3d.geometry.KDTreeSearchParamHybrid(radius=max_dist, max_nn=30)
                 )
-        current_T = icp0.transformation
-        fine = None
-        for icp_scale, icp_iter in [(4.0, 50), (2.0, 80), (1.0, 150)]:
-            fine = o3d.pipelines.registration.registration_icp(
-                model_for_icp, target_cluster,
-                max_correspondence_distance=base_dist * icp_scale,
-                init=current_T,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    relative_fitness=1e-7, relative_rmse=1e-7, max_iteration=icp_iter,
-                ),
-            )
-            current_T = fine.transformation
 
-        # Colored ICP 최종 정밀화 (색상 정보가 있을 때)
-        if model_for_icp.has_colors() and target_cluster.has_colors():
-            try:
-                fine_color = o3d.pipelines.registration.registration_colored_icp(
-                    model_for_icp, target_cluster,
-                    max_correspondence_distance=base_dist,
-                    init=current_T,
-                    estimation_method=o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                icp = o3d.pipelines.registration.registration_icp(
+                    src_c,
+                    tgt_n,
+                    max_correspondence_distance=max_dist,
+                    init=np.eye(4),
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
                     criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                        relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=100,
+                        relative_fitness=1e-7,
+                        relative_rmse=1e-7,
+                        max_iteration=80,
                     ),
                 )
-                if fine_color.fitness >= fine.fitness * 0.8:
-                    fine = fine_color
-                    print(f"  Colored ICP 적용됨: fitness={fine_color.fitness:.4f}")
-            except Exception:
-                pass
-        print(f"\n  정밀 ICP (Multi-scale): fitness={fine.fitness:.4f}  RMSE={fine.inlier_rmse:.6f}")
+                total_T = np.asarray(icp.transformation) @ T_init
+                if icp.fitness > best_local_fitness:
+                    best_local_fitness = float(icp.fitness)
+                    best_local_T = total_T
 
-        # 누적 변환: T_fine @ T_cand (model_s 원점 기준)
-        T_total = np.array(fine.transformation) @ cand_T
+            if best_local_fitness < 0.1:
+                print(
+                    f"    scale={scale:.4f} ({real_size*100:.1f}cm): "
+                    f"fitness={best_local_fitness:.3f} -> skip"
+                )
+                continue
 
-        # centroid fallback: fitness 너무 낮으면 centroid만 적용
-        model_aligned = _make_scaled_pcd(best_result["scale"])
-        if fine.fitness < 0.05:
-            print("  [경고] ICP fitness 낮음 → centroid 정렬만 적용")
-            T_total = np.eye(4)
-            T_total[:3, 3] = best_result["cl_center"]
-        model_aligned.transform(T_total)
-        model_aligned.paint_uniform_color([1.0, 0.0, 0.0])
-
-        if edge_context is not None:
-            final_edge_cost, final_vis = PoseRefiner2D.projection_edge_cost(
-                np.asarray(model_aligned.points), edge_context, sample_size=1500
+            src_r = o3d.geometry.PointCloud(src)
+            src_r.transform(best_local_T)
+            src_r.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=max_dist, max_nn=30)
             )
-            print(f"  최종 멀티뷰 edge cost={final_edge_cost:.2f}px  visibility={final_vis:.3f}")
-        if observation_context is not None:
-            final_obs_score, final_obs_detail = PoseRefiner2D.projection_observation_score(
-                np.asarray(model_aligned.points), observation_context, sample_size=5000
+
+            cur_T = np.eye(4)
+            icp = None
+            for icp_scale in [3.0, 1.5, 0.8]:
+                icp = o3d.pipelines.registration.registration_icp(
+                    src_r,
+                    tgt_n,
+                    max_correspondence_distance=max_dist * icp_scale,
+                    init=cur_T,
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                        relative_fitness=1e-8,
+                        relative_rmse=1e-8,
+                        max_iteration=200,
+                    ),
+                )
+                cur_T = np.asarray(icp.transformation)
+
+            final_T = cur_T @ best_local_T
+            aligned = (final_T @ np.hstack([scaled_pts, np.ones((len(scaled_pts), 1))]).T)[:3].T
+            depth_sc = PoseEstimator._multiview_depth_score(aligned, camera_data_list)
+            coverage = PoseEstimator._coverage_score(
+                aligned,
+                objects_pcd,
+                radius=max(real_size * 0.1, 0.003),
             )
+            combined = depth_sc * coverage
+            final_fitness = float(icp.fitness) if icp is not None else 0.0
+            final_rmse = float(icp.inlier_rmse) if icp is not None else 0.0
+
             print(
-                f"  최종 관측 일치도={final_obs_score:.3f}  "
-                f"mask={final_obs_detail['mask']:.3f}  "
-                f"depth={final_obs_detail['depth']:.3f}  "
-                f"depth_err={final_obs_detail['depth_err_mm']:.1f}mm"
+                f"    scale={scale:.4f} ({real_size*100:.1f}cm): "
+                f"fitness={final_fitness:.3f}  depth={depth_sc:.3f}  "
+                f"cov={coverage:.3f}  -> score={combined:.4f}"
             )
-        else:
-            final_obs_score = 1.0
-        if mesh_render_context is not None:
-            final_mesh_score, final_mesh_detail = PoseRefiner2D.mesh_render_score(
-                T_total,
-                best_result["scale"],
-                mesh_render_context,
-            )
-            print(
-                f"  최종 mesh render 일치도={final_mesh_score:.3f}  "
-                f"mask={final_mesh_detail['mask']:.3f}  "
-                f"depth={final_mesh_detail['depth']:.3f}  "
-                f"depth_err={final_mesh_detail['depth_err_mm']:.1f}mm"
-            )
-        else:
-            final_mesh_score = 1.0
-        if edge_context is None:
-            final_edge_cost = 0.0
 
-        cluster_pts = np.asarray(cluster.points)
-        model_pts = np.asarray(model_aligned.points)
-        if len(cluster_pts) > 0 and len(model_pts) > 0:
-            d_cov, _ = cKDTree(model_pts).query(cluster_pts, k=1)
-            coverage = float(np.mean(d_cov < max_dist))
-        else:
-            coverage = 0.0
-        print(f"  cluster coverage={coverage:.4f}")
+            if combined > best_score:
+                best_score = combined
+                best = {
+                    "transform": final_T,
+                    "scale": float(scale),
+                    "score": float(combined),
+                    "depth_score": float(depth_sc),
+                    "coverage": float(coverage),
+                    "fitness": final_fitness,
+                    "rmse": final_rmse,
+                    "scaled_pts": scaled_pts,
+                }
 
-        # Pose 추출
-        R = T_total[:3, :3].copy()
-        U, _, Vt = np.linalg.svd(R)
-        R = (U @ Vt).copy()
-        t = np.asarray(model_aligned.points).mean(axis=0).copy()
-        rot = Rotation.from_matrix(R)
+        if best is None:
+            raise RuntimeError("정합 실패 - 물체를 찾지 못했습니다.")
+
+        T_raw = np.asarray(best["transform"], dtype=np.float64)
+        R_raw = T_raw[:3, :3]
+        U, _, Vt = np.linalg.svd(R_raw)
+        R = U @ Vt
+        if np.linalg.det(R) < 0:
+            U[:, -1] *= -1
+            R = U @ Vt
+        t = T_raw[:3, 3].copy()
         T_out = np.eye(4)
         T_out[:3, :3] = R
         T_out[:3, 3] = t
 
+        model_aligned = o3d.geometry.PointCloud()
+        model_aligned.points = o3d.utility.Vector3dVector(best["scaled_pts"])
+        model_aligned.transform(T_out)
+        model_aligned.paint_uniform_color([1.0, 0.0, 0.0])
+
+        rot = Rotation.from_matrix(R)
         pose = PoseResult(
             translation=t,
             rotation_matrix=R,
             euler_xyz_deg=rot.as_euler("xyz", degrees=True),
             quaternion_xyzw=rot.as_quat(),
             transform_4x4=T_out,
-            fitness=fine.fitness,
-            coverage=coverage,
-            rmse=fine.inlier_rmse,
-            edge_cost_px=float(final_edge_cost),
-            observation_score=float(final_obs_score),
-            mesh_render_score=float(final_mesh_score),
-            descriptor_score=float(best_result.get("desc_sim", 0.0)),
+            scale=best["scale"],
+            score=best["score"],
+            depth_score=best["depth_score"],
+            coverage=best["coverage"],
+            fitness=best["fitness"],
+            rmse=best["rmse"],
             method="Reference Matching",
         )
-        print(f"  위치: {np.round(t, 4)} m  회전: {np.round(rot.as_euler('xyz', degrees=True), 1)} deg")
-        return pose, model_aligned, best_result["scale"]
-
-
-# =============================================================================
-# 5. 2D 엣지 기반 포즈 정밀화
-# =============================================================================
-
-class PoseRefiner2D:
-    """
-    ICP 결과를 이미지 엣지에 맞춰 정밀화.
-    - 위치 탐색 범위: ICP 결과 ±search_r (기본 3cm)
-    - 회전 탐색 범위: ICP 결과 ±rot_deg (기본 30°)
-    """
-
-    @staticmethod
-    def build_edge_context(camera_data_list: list) -> Dict[str, list]:
-        dist_maps, inv_T_list, K_list, img_shapes = [], [], [], []
-        for cam_data in camera_data_list:
-            gray = cv2.cvtColor(cam_data.color_img, cv2.COLOR_RGB2GRAY)
-            blur = cv2.GaussianBlur(gray, (7, 7), 1.5)
-            edges = cv2.Canny(blur, 30, 90)
-            edges = cv2.dilate(edges, np.ones((7, 7), np.uint8), iterations=2)
-            dist = cv2.distanceTransform(255 - edges, cv2.DIST_L2, 5)
-            dist_maps.append(dist.astype(np.float32))
-            inv_T_list.append(np.linalg.inv(cam_data.T_to_cam0).astype(np.float64))
-            K_list.append(cam_data.intrinsics.K.astype(np.float64))
-            img_shapes.append(cam_data.color_img.shape[:2])
-        return {
-            "dist_maps": dist_maps,
-            "inv_T_list": inv_T_list,
-            "K_list": K_list,
-            "img_shapes": img_shapes,
-        }
-
-    @staticmethod
-    def build_observation_context(
-        camera_data_list: list,
-        plane_model: Optional[np.ndarray] = None,
-        min_height: float = 0.002,
-        max_height: float = 0.12,
-        min_component_area: int = 120,
-    ) -> Dict[str, list]:
-        obs_masks, labels_list, depth_maps = [], [], []
-        inv_T_list, T_to_cam0_list, K_list, img_shapes = [], [], [], []
-
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-
-        normal = None
-        normal_norm = 0.0
-        plane_offset = 0.0
-        if plane_model is not None:
-            normal = np.asarray(plane_model[:3], dtype=np.float64)
-            normal_norm = float(np.linalg.norm(normal))
-            plane_offset = float(plane_model[3])
-
-        for cam_data in camera_data_list:
-            K = cam_data.intrinsics.K.astype(np.float64)
-            depth = cam_data.depth_img.astype(np.float64) * float(cam_data.intrinsics.depth_scale)
-            h, w = depth.shape[:2]
-            valid = depth > 0.05
-
-            if normal is not None and normal_norm > 1e-9:
-                u, v = np.meshgrid(np.arange(w), np.arange(h))
-                fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-                x = (u - cx) * depth / fx
-                y = (v - cy) * depth / fy
-                pts = np.stack([x, y, depth], axis=-1).reshape(-1, 3)
-                pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float64)])
-                pts_cam0 = (cam_data.T_to_cam0.astype(np.float64) @ pts_h.T)[:3].T.reshape(h, w, 3)
-                signed_dist = (pts_cam0 @ normal + plane_offset) / normal_norm
-                mask = valid & (signed_dist >= min_height) & (signed_dist <= max_height)
-            else:
-                mask = valid
-
-            mask_u8 = (mask.astype(np.uint8) * 255)
-            if mask_u8.any():
-                mask_u8 = cv2.medianBlur(mask_u8, 5)
-                mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel_open, iterations=1)
-                mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel_close, iterations=2)
-
-            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-            if n_labels > 1:
-                filtered = np.zeros_like(mask_u8)
-                for label in range(1, n_labels):
-                    if stats[label, cv2.CC_STAT_AREA] >= min_component_area:
-                        filtered[labels == label] = 255
-                mask_u8 = filtered
-                _, labels, _, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-
-            obs_masks.append(mask_u8 > 0)
-            labels_list.append(labels.astype(np.int32))
-            depth_maps.append(depth.astype(np.float32))
-            inv_T_list.append(np.linalg.inv(cam_data.T_to_cam0).astype(np.float64))
-            T_to_cam0_list.append(cam_data.T_to_cam0.astype(np.float64))
-            K_list.append(K)
-            img_shapes.append((h, w))
-
-        return {
-            "obs_masks": obs_masks,
-            "labels_list": labels_list,
-            "depth_maps": depth_maps,
-            "inv_T_list": inv_T_list,
-            "T_to_cam0_list": T_to_cam0_list,
-            "K_list": K_list,
-            "img_shapes": img_shapes,
-        }
-
-    @staticmethod
-    def build_mesh_render_context(
-        ref_mesh: Optional[trimesh.Trimesh],
-        ref_center: np.ndarray,
-        observation_context: Optional[Dict[str, list]],
-        render_scale: float = 0.5,
-        max_faces: int = 3000,
-    ) -> Optional[Dict[str, list]]:
-        if ref_mesh is None or observation_context is None:
-            return None
-        if len(ref_mesh.vertices) == 0 or len(ref_mesh.faces) == 0:
-            return None
-
-        vertices_local = ref_mesh.vertices.astype(np.float32) - np.asarray(ref_center, dtype=np.float32)
-        faces = ref_mesh.faces.astype(np.int32)
-        orig_face_count = len(faces)
-
-        if max_faces is not None and max_faces > 0 and len(faces) > max_faces:
-            face_area = np.asarray(ref_mesh.area_faces, dtype=np.float64)
-            face_area = np.clip(face_area, 1e-12, None)
-            probs = face_area / face_area.sum()
-            rng = np.random.default_rng(0)
-            sel = rng.choice(len(faces), size=max_faces, replace=False, p=probs)
-            faces = faces[sel]
-
-        labels_small, depth_small, K_small, shape_small = [], [], [], []
-        for labels, depth, K, (h, w) in zip(
-            observation_context["labels_list"],
-            observation_context["depth_maps"],
-            observation_context["K_list"],
-            observation_context["img_shapes"],
-        ):
-            hs = max(32, int(round(h * render_scale)))
-            ws = max(32, int(round(w * render_scale)))
-            sx = ws / float(w)
-            sy = hs / float(h)
-
-            labels_ds = cv2.resize(labels.astype(np.int32), (ws, hs), interpolation=cv2.INTER_NEAREST)
-            depth_ds = cv2.resize(depth.astype(np.float32), (ws, hs), interpolation=cv2.INTER_NEAREST)
-            K_ds = K.copy().astype(np.float64)
-            K_ds[0, 0] *= sx
-            K_ds[0, 2] *= sx
-            K_ds[1, 1] *= sy
-            K_ds[1, 2] *= sy
-
-            labels_small.append(labels_ds)
-            depth_small.append(depth_ds)
-            K_small.append(K_ds)
-            shape_small.append((hs, ws))
-
         print(
-            f"  mesh render context: {orig_face_count} → {len(faces)} faces, "
-            f"render_scale={render_scale:.2f}"
+            f"  위치: {np.round(t, 4)} m  "
+            f"회전: {np.round(pose.euler_xyz_deg, 1)} deg"
         )
-        return {
-            "vertices_local": vertices_local,
-            "faces": faces,
-            "inv_T_list": observation_context["inv_T_list"],
-            "labels_list": labels_small,
-            "depth_maps": depth_small,
-            "K_list": K_small,
-            "img_shapes": shape_small,
-        }
-
-    @staticmethod
-    def _rasterize_mesh_depth(
-        vertices_local: np.ndarray,
-        faces: np.ndarray,
-        T_cam0: np.ndarray,
-        scale: float,
-        inv_T: np.ndarray,
-        K: np.ndarray,
-        image_shape: Tuple[int, int],
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
-        h, w = image_shape
-        zbuf = np.full((h, w), np.inf, dtype=np.float32)
-        if vertices_local is None or faces is None or len(vertices_local) == 0 or len(faces) == 0:
-            return np.zeros((h, w), dtype=bool), zbuf, 0.0
-
-        verts = np.asarray(vertices_local, dtype=np.float64) * float(scale)
-        T = np.asarray(inv_T, dtype=np.float64) @ np.asarray(T_cam0, dtype=np.float64)
-        verts_h = np.hstack([verts, np.ones((len(verts), 1), dtype=np.float64)])
-        verts_cam = (T @ verts_h.T)[:3].T
-
-        tri = verts_cam[np.asarray(faces, dtype=np.int32)]
-        tri_z = tri[:, :, 2]
-        valid = np.all(tri_z > 0.03, axis=1)
-        if valid.sum() == 0:
-            return np.zeros((h, w), dtype=bool), zbuf, 0.0
-
-        tri = tri[valid]
-        tri_z = tri_z[valid]
-        fx, fy = float(K[0, 0]), float(K[1, 1])
-        cx, cy = float(K[0, 2]), float(K[1, 2])
-        tri_u = fx * tri[:, :, 0] / tri_z + cx
-        tri_v = fy * tri[:, :, 1] / tri_z + cy
-
-        tri_min_u = np.floor(np.min(tri_u, axis=1)).astype(np.int32)
-        tri_max_u = np.ceil(np.max(tri_u, axis=1)).astype(np.int32)
-        tri_min_v = np.floor(np.min(tri_v, axis=1)).astype(np.int32)
-        tri_max_v = np.ceil(np.max(tri_v, axis=1)).astype(np.int32)
-
-        tri_visible = (
-            (tri_max_u >= 0) & (tri_max_v >= 0) &
-            (tri_min_u < w) & (tri_min_v < h)
-        )
-        if tri_visible.sum() == 0:
-            return np.zeros((h, w), dtype=bool), zbuf, 0.0
-
-        tri = tri[tri_visible]
-        tri_z = tri_z[tri_visible]
-        tri_u = tri_u[tri_visible]
-        tri_v = tri_v[tri_visible]
-
-        vis_vertices = np.any(
-            (tri_u >= 0) & (tri_u < w) & (tri_v >= 0) & (tri_v < h),
-            axis=1,
-        )
-        visible_ratio = float(vis_vertices.sum()) / max(float(len(valid)), 1.0)
-
-        order = np.argsort(np.min(tri_z, axis=1))
-        tri = tri[order]
-        tri_z = tri_z[order]
-        tri_u = tri_u[order]
-        tri_v = tri_v[order]
-
-        eps = 1e-7
-        for pts3, z3, u3, v3 in zip(tri, tri_z, tri_u, tri_v):
-            x1 = max(0, int(np.floor(np.min(u3))))
-            x2 = min(w - 1, int(np.ceil(np.max(u3))))
-            y1 = max(0, int(np.floor(np.min(v3))))
-            y2 = min(h - 1, int(np.ceil(np.max(v3))))
-            if x2 < x1 or y2 < y1:
-                continue
-
-            x0, y0 = float(u3[0]), float(v3[0])
-            x1f, y1f = float(u3[1]), float(v3[1])
-            x2f, y2f = float(u3[2]), float(v3[2])
-            area = (x1f - x0) * (y2f - y0) - (y1f - y0) * (x2f - x0)
-            if abs(area) < eps:
-                continue
-
-            xs = np.arange(x1, x2 + 1, dtype=np.float32) + 0.5
-            ys = np.arange(y1, y2 + 1, dtype=np.float32) + 0.5
-            xx, yy = np.meshgrid(xs, ys)
-
-            w0 = ((x1f - xx) * (y2f - yy) - (y1f - yy) * (x2f - xx)) / area
-            w1 = ((x2f - xx) * (y0 - yy) - (y2f - yy) * (x0 - xx)) / area
-            w2 = 1.0 - w0 - w1
-            inside = (w0 >= -1e-4) & (w1 >= -1e-4) & (w2 >= -1e-4)
-            if not inside.any():
-                continue
-
-            inv_depth = w0 / z3[0] + w1 / z3[1] + w2 / z3[2]
-            depth = np.where(inv_depth > eps, 1.0 / inv_depth, np.inf).astype(np.float32)
-
-            region = zbuf[y1:y2 + 1, x1:x2 + 1]
-            update = inside & (depth < region)
-            if update.any():
-                region[update] = depth[update]
-
-        mask = np.isfinite(zbuf)
-        if mask.any():
-            mask_u8 = (mask.astype(np.uint8) * 255)
-            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
-            mask = mask_u8 > 0
-        return mask, zbuf, visible_ratio
-
-    @staticmethod
-    def mesh_render_score(
-        T_cam0: np.ndarray,
-        scale: float,
-        mesh_render_context: Optional[Dict[str, list]],
-        min_visible_ratio: float = 0.03,
-    ) -> Tuple[float, Dict[str, float]]:
-        if mesh_render_context is None:
-            return 1.0, {
-                "mask": 1.0,
-                "depth": 1.0,
-                "vis": 1.0,
-                "depth_err_mm": 0.0,
-            }
-
-        total = 0.0
-        cam_count = 0
-        mask_scores, depth_scores, vis_scores, depth_errs = [], [], [], []
-
-        for inv_T, K, labels, obs_depth, shape in zip(
-            mesh_render_context["inv_T_list"],
-            mesh_render_context["K_list"],
-            mesh_render_context["labels_list"],
-            mesh_render_context["depth_maps"],
-            mesh_render_context["img_shapes"],
-        ):
-            pred_mask, pred_depth, vis = PoseRefiner2D._rasterize_mesh_depth(
-                mesh_render_context["vertices_local"],
-                mesh_render_context["faces"],
-                T_cam0,
-                scale,
-                inv_T,
-                K,
-                shape,
-            )
-            vis_scores.append(vis)
-            if pred_mask.sum() < 20 or vis < min_visible_ratio:
-                continue
-
-            overlap_labels = labels[pred_mask]
-            overlap_labels = overlap_labels[overlap_labels > 0]
-            if len(overlap_labels) == 0:
-                mask_scores.append(0.0)
-                depth_scores.append(0.0)
-                depth_errs.append(80.0)
-                cam_count += 1
-                continue
-
-            counts = np.bincount(overlap_labels)
-            best_label = int(np.argmax(counts[1:]) + 1) if len(counts) > 1 else 0
-            comp_mask = labels == best_label
-
-            inter = float(np.logical_and(pred_mask, comp_mask).sum())
-            union = float(np.logical_or(pred_mask, comp_mask).sum())
-            pred_area = float(pred_mask.sum())
-            comp_area = float(comp_mask.sum())
-            precision = inter / max(pred_area, 1.0)
-            recall = inter / max(comp_area, 1.0)
-            iou = inter / max(union, 1.0)
-            mask_score = float(0.5 * iou + 0.25 * precision + 0.25 * recall)
-
-            depth_valid = np.isfinite(pred_depth) & comp_mask & (obs_depth > 0.05)
-            if depth_valid.sum() >= 20:
-                depth_err = float(np.median(np.abs(pred_depth[depth_valid] - obs_depth[depth_valid])))
-                depth_score = float(np.exp(-depth_err / 0.008))
-            else:
-                depth_err = 0.080
-                depth_score = 0.0
-
-            vis_term = float(np.clip(vis / 0.10, 0.2, 1.0))
-            cam_score = mask_score * depth_score * vis_term
-
-            mask_scores.append(mask_score)
-            depth_scores.append(depth_score)
-            depth_errs.append(depth_err * 1000.0)
-            total += cam_score
-            cam_count += 1
-
-        if cam_count == 0:
-            return 0.0, {
-                "mask": 0.0,
-                "depth": 0.0,
-                "vis": float(np.mean(vis_scores)) if vis_scores else 0.0,
-                "depth_err_mm": 1e6,
-            }
-
-        return total / float(cam_count), {
-            "mask": float(np.mean(mask_scores)) if mask_scores else 0.0,
-            "depth": float(np.mean(depth_scores)) if depth_scores else 0.0,
-            "vis": float(np.mean(vis_scores)) if vis_scores else 0.0,
-            "depth_err_mm": float(np.mean(depth_errs)) if depth_errs else 1e6,
-        }
-
-    @staticmethod
-    def _rasterize_projected_points(
-        pts_cam: np.ndarray,
-        K: np.ndarray,
-        image_shape: Tuple[int, int],
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
-        h, w = image_shape
-        if len(pts_cam) == 0:
-            return np.zeros((h, w), dtype=bool), np.full((h, w), np.inf, dtype=np.float32), 0.0
-
-        valid = pts_cam[:, 2] > 0.05
-        if valid.sum() == 0:
-            return np.zeros((h, w), dtype=bool), np.full((h, w), np.inf, dtype=np.float32), 0.0
-
-        p = pts_cam[valid]
-        u = (K[0, 0] * p[:, 0] / p[:, 2] + K[0, 2]).astype(np.int32)
-        v = (K[1, 1] * p[:, 1] / p[:, 2] + K[1, 2]).astype(np.int32)
-        ok = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-        visible_ratio = float(ok.sum()) / float(len(pts_cam))
-        if ok.sum() == 0:
-            return np.zeros((h, w), dtype=bool), np.full((h, w), np.inf, dtype=np.float32), visible_ratio
-
-        u = u[ok]
-        v = v[ok]
-        z = p[ok, 2].astype(np.float32)
-
-        flat = v * w + u
-        order = np.argsort(z)
-        flat_sorted = flat[order]
-        first = np.r_[True, flat_sorted[1:] != flat_sorted[:-1]]
-        keep = order[first]
-
-        depth_raster = np.full((h, w), np.inf, dtype=np.float32)
-        depth_raster[v[keep], u[keep]] = z[keep]
-
-        support_mask = np.isfinite(depth_raster)
-        mask_u8 = (support_mask.astype(np.uint8) * 255)
-        mask_u8 = cv2.dilate(mask_u8, np.ones((3, 3), np.uint8), iterations=1)
-        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
-        return mask_u8 > 0, depth_raster, visible_ratio
-
-    @staticmethod
-    def projection_observation_score(
-        pts_cam0: np.ndarray,
-        observation_context: Dict[str, list],
-        sample_size: Optional[int] = 6000,
-        min_visible_ratio: float = 0.03,
-    ) -> Tuple[float, Dict[str, float]]:
-        pts = np.asarray(pts_cam0, dtype=np.float64)
-        if len(pts) == 0:
-            return 0.0, {
-                "mask": 0.0,
-                "depth": 0.0,
-                "vis": 0.0,
-                "depth_err_mm": 1e6,
-            }
-
-        if sample_size is not None and len(pts) > sample_size:
-            rng = np.random.default_rng(0)
-            idx = rng.choice(len(pts), sample_size, replace=False)
-            pts = pts[idx]
-
-        pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float64)])
-        total_score = 0.0
-        cam_count = 0
-        mask_scores, depth_scores, vis_scores, depth_errs = [], [], [], []
-
-        for inv_T, K, (h, w), obs_mask, labels, obs_depth in zip(
-            observation_context["inv_T_list"],
-            observation_context["K_list"],
-            observation_context["img_shapes"],
-            observation_context["obs_masks"],
-            observation_context["labels_list"],
-            observation_context["depth_maps"],
-        ):
-            pc = (inv_T @ pts_h.T)[:3].T
-            pred_mask, pred_depth, vis_ratio = PoseRefiner2D._rasterize_projected_points(
-                pc, K, (h, w)
-            )
-            vis_scores.append(vis_ratio)
-            if pred_mask.sum() < 40 or vis_ratio < min_visible_ratio:
-                continue
-
-            overlap_labels = labels[pred_mask]
-            overlap_labels = overlap_labels[overlap_labels > 0]
-            if len(overlap_labels) == 0:
-                mask_scores.append(0.0)
-                depth_scores.append(0.0)
-                depth_errs.append(50.0)
-                cam_count += 1
-                continue
-
-            counts = np.bincount(overlap_labels)
-            best_label = int(np.argmax(counts[1:]) + 1) if len(counts) > 1 else 0
-            comp_mask = labels == best_label
-
-            inter = np.logical_and(pred_mask, comp_mask).sum()
-            pred_area = int(pred_mask.sum())
-            comp_area = int(comp_mask.sum())
-            precision = inter / max(pred_area, 1)
-            recall = inter / max(comp_area, 1)
-            mask_score = float(precision * np.sqrt(max(recall, 0.0)))
-
-            depth_valid = (
-                np.isfinite(pred_depth)
-                & comp_mask
-                & (obs_depth > 0.05)
-            )
-            if depth_valid.sum() >= 25:
-                depth_err = float(np.median(np.abs(pred_depth[depth_valid] - obs_depth[depth_valid])))
-                depth_score = float(np.exp(-depth_err / 0.010))
-            else:
-                depth_err = 0.050
-                depth_score = 0.25
-
-            vis_term = float(np.clip(vis_ratio / 0.10, 0.2, 1.0))
-            cam_score = mask_score * depth_score * vis_term
-
-            mask_scores.append(mask_score)
-            depth_scores.append(depth_score)
-            depth_errs.append(depth_err * 1000.0)
-            total_score += cam_score
-            cam_count += 1
-
-        if cam_count == 0:
-            return 0.0, {
-                "mask": 0.0,
-                "depth": 0.0,
-                "vis": float(np.mean(vis_scores)) if vis_scores else 0.0,
-                "depth_err_mm": 1e6,
-            }
-
-        return total_score / float(cam_count), {
-            "mask": float(np.mean(mask_scores)) if mask_scores else 0.0,
-            "depth": float(np.mean(depth_scores)) if depth_scores else 0.0,
-            "vis": float(np.mean(vis_scores)) if vis_scores else 0.0,
-            "depth_err_mm": float(np.mean(depth_errs)) if depth_errs else 1e6,
-        }
-
-    @staticmethod
-    def projection_edge_cost(
-        pts_cam0: np.ndarray,
-        edge_context: Dict[str, list],
-        sample_size: Optional[int] = 1500,
-        min_visible_ratio: float = 0.03,
-    ) -> Tuple[float, float]:
-        pts = np.asarray(pts_cam0, dtype=np.float64)
-        if len(pts) == 0:
-            return 1e6, 0.0
-
-        if sample_size is not None and len(pts) > sample_size:
-            rng = np.random.default_rng(0)
-            idx = rng.choice(len(pts), sample_size, replace=False)
-            pts = pts[idx]
-
-        pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float64)])
-        total_cost = 0.0
-        visibilities = []
-
-        for inv_T, K, dm, (h, w) in zip(
-            edge_context["inv_T_list"],
-            edge_context["K_list"],
-            edge_context["dist_maps"],
-            edge_context["img_shapes"],
-        ):
-            pc = (inv_T @ pts_h.T)[:3].T
-            valid = pc[:, 2] > 0.05
-            if valid.sum() == 0:
-                total_cost += 1e3
-                visibilities.append(0.0)
-                continue
-
-            p = pc[valid]
-            u = (K[0, 0] * p[:, 0] / p[:, 2] + K[0, 2]).astype(np.int32)
-            v = (K[1, 1] * p[:, 1] / p[:, 2] + K[1, 2]).astype(np.int32)
-            ok = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-            visible_ratio = float(ok.sum()) / float(len(pts))
-            visibilities.append(visible_ratio)
-
-            if ok.sum() == 0:
-                total_cost += 1e3
-                continue
-
-            mean_dist = float(dm[v[ok], u[ok]].mean())
-            visibility_penalty = 120.0 * max(0.0, min_visible_ratio - visible_ratio) / max(min_visible_ratio, 1e-6)
-            total_cost += mean_dist + visibility_penalty
-
-        return total_cost / max(len(edge_context["dist_maps"]), 1), float(np.mean(visibilities))
-
-    @staticmethod
-    def refine(
-        model_pcd: o3d.geometry.PointCloud,
-        pose_init: "PoseResult",
-        camera_data_list: list,
-        n_samples: int = 2000,
-        n_iter: int = 800,
-        search_r: float = 0.02,    # 위치 탐색 반경 (m)
-        rot_deg: float = 20.0,     # 회전 탐색 범위 (deg)
-        output_dir: Optional[str] = None,
-    ) -> Tuple["PoseResult", o3d.geometry.PointCloud]:
-        from scipy.optimize import minimize
-
-        print("\n" + "=" * 60)
-        print("[2D 정밀화] GLB → 이미지 엣지 직접 정합")
-        print("=" * 60)
-
-        if pose_init.fitness < 0.05:
-            print("  [경고] 3D 정합 fitness가 너무 낮아 2D 정밀화를 생략합니다.")
-            return pose_init, model_pcd
-
-        all_pts = np.asarray(model_pcd.points).astype(np.float64)
-        rng = np.random.default_rng(0)
-        idx = rng.choice(len(all_pts), min(n_samples, len(all_pts)), replace=False)
-        pts = all_pts[idx]
-        centroid0 = pts.mean(axis=0).copy()
-        pts_local = pts - centroid0  # 크기·형상 고정, 원점 기준
-
-        edge_context = PoseRefiner2D.build_edge_context(camera_data_list)
-
-        rv0 = Rotation.from_matrix(pose_init.rotation_matrix).as_rotvec()
-        rot_bound = np.deg2rad(rot_deg)
-
-        # 파라미터: delta_rotvec(3) + delta_t(3) — ICP 결과 기준 상대값
-        def _cost(delta):
-            try:
-                rv = rv0 + delta[:3]
-                t  = centroid0 + delta[3:6]
-                R  = Rotation.from_rotvec(rv).as_matrix()
-                pts_c0 = pts_local @ R.T + t
-                edge_cost, _ = PoseRefiner2D.projection_edge_cost(
-                    pts_c0, edge_context, sample_size=None
-                )
-                reg_t = 1.5 * np.linalg.norm(delta[3:6]) / max(search_r, 1e-6)
-                reg_r = 0.5 * np.linalg.norm(delta[:3]) / max(rot_bound, 1e-6)
-                return edge_cost + reg_t + reg_r
-            except Exception:
-                return 1e6
-
-        x0 = np.zeros(6)
-        c0 = _cost(x0)
-        c0_edge, c0_vis = PoseRefiner2D.projection_edge_cost(pts, edge_context, sample_size=None)
-        print(f"  초기 cost={c0:.3f}  edge={c0_edge:.3f}px  vis={c0_vis:.3f}  centroid={np.round(centroid0, 3)}")
-
-        # 탐색 범위 제한 (bounds)
-        b_t = search_r
-        b_r = rot_bound
-        bounds = [(-b_r, b_r)] * 3 + [(-b_t, b_t)] * 3
-
-        result = minimize(_cost, x0, method="L-BFGS-B", bounds=bounds,
-                          options={"maxiter": n_iter, "ftol": 1e-5, "gtol": 1e-5})
-        c1 = result.fun
-        rv_test = rv0 + result.x[:3]
-        t_test = centroid0 + result.x[3:6]
-        R_test = Rotation.from_rotvec(rv_test).as_matrix()
-        pts_test = pts_local @ R_test.T + t_test
-        c1_edge, c1_vis = PoseRefiner2D.projection_edge_cost(pts_test, edge_context, sample_size=None)
-        print(f"  최종 cost={c1:.3f}  edge={c1_edge:.3f}px  vis={c1_vis:.3f}  (iter={result.nit})")
-
-        hit_translation_bound = np.any(np.isclose(np.abs(result.x[3:6]), b_t, atol=max(1e-4, b_t * 0.05)))
-        hit_rotation_bound = np.any(np.isclose(np.abs(result.x[:3]), b_r, atol=max(1e-3, b_r * 0.05)))
-
-        if (
-            (not result.success)
-            or (c1 >= c0 * 0.97)
-            or (c1_vis < max(0.05, c0_vis * 0.7))
-            or hit_translation_bound
-            or hit_rotation_bound
-        ):
-            print("  [경고] 유의미한 개선 없음 → ICP 결과 유지")
-            return pose_init, model_pcd
-
-        # 결과 적용
-        rv_opt = rv0 + result.x[:3]
-        t_opt  = centroid0 + result.x[3:6]
-        R_raw  = Rotation.from_rotvec(rv_opt).as_matrix()
-        U, _, Vt = np.linalg.svd(R_raw)
-        R_opt  = (U @ Vt).copy()
-
-        new_pts = pts_local @ R_opt.T + t_opt  # 샘플링된 점
-        all_local = all_pts - centroid0
-        all_new = all_local @ R_opt.T + t_opt  # 전체 점
-
-        new_pcd = o3d.geometry.PointCloud()
-        new_pcd.points = o3d.utility.Vector3dVector(all_new)
-        new_pcd.paint_uniform_color([1.0, 0.0, 0.0])
-
-        rot_obj = Rotation.from_matrix(R_opt)
-        t_final = all_new.mean(axis=0).copy()
-        T_out = np.eye(4)
-        T_out[:3, :3] = R_opt
-        T_out[:3, 3] = t_final
-        new_pose = PoseResult(
-            translation=t_final,
-            rotation_matrix=R_opt,
-            euler_xyz_deg=rot_obj.as_euler("xyz", degrees=True),
-            quaternion_xyzw=rot_obj.as_quat(),
-            transform_4x4=T_out,
-            fitness=pose_init.fitness,
-            coverage=pose_init.coverage,
-            rmse=pose_init.rmse,
-            edge_cost_px=pose_init.edge_cost_px,
-            observation_score=pose_init.observation_score,
-            mesh_render_score=pose_init.mesh_render_score,
-            descriptor_score=pose_init.descriptor_score,
-            method="Reference Matching + 2D Refinement",
-        )
-        print(f"  정밀화 위치: {np.round(t_final, 4)} m  "
-              f"이동: {np.round(result.x[3:6]*100, 2)} cm  "
-              f"회전 보정: {np.round(np.rad2deg(result.x[:3]), 1)} deg")
-
-        if output_dir is not None:
-            PoseRefiner2D._save_debug(
-                all_new,
-                camera_data_list,
-                edge_context["dist_maps"],
-                edge_context["inv_T_list"],
-                edge_context["K_list"],
-                output_dir,
-            )
-        return new_pose, new_pcd
-
-    @staticmethod
-    def _save_debug(pts_cam0, camera_data_list, dist_maps, inv_T_list, K_list, output_dir):
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        pts_h = np.hstack([pts_cam0, np.ones((len(pts_cam0), 1))])
-        for i, (cam_data, inv_T, K, dm) in enumerate(
-                zip(camera_data_list, inv_T_list, K_list, dist_maps)):
-            pc = (inv_T @ pts_h.T)[:3].T
-            valid = pc[:, 2] > 0.05
-            if valid.sum() == 0:
-                continue
-            p = pc[valid]
-            u = (K[0, 0] * p[:, 0] / p[:, 2] + K[0, 2]).astype(np.int32)
-            v = (K[1, 1] * p[:, 1] / p[:, 2] + K[1, 2]).astype(np.int32)
-            h, w = cam_data.color_img.shape[:2]
-            ok = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            axes[0].imshow(cam_data.color_img)
-            axes[0].scatter(u[ok], v[ok], c="lime", s=2, alpha=0.6)
-            axes[0].set_title(f"cam{i} — 2D 정밀화")
-            axes[0].axis("off")
-            axes[1].imshow((dm < 5).astype(np.uint8) * 255, cmap="gray")
-            axes[1].scatter(u[ok], v[ok], c="red", s=2, alpha=0.6)
-            axes[1].set_title(f"cam{i} — 엣지맵")
-            axes[1].axis("off")
-            plt.tight_layout()
-            out = os.path.join(output_dir, f"refine2d_cam{i}.png")
-            plt.savefig(out, dpi=150)
-            plt.close()
-            print(f"  [2D 디버그] {out}")
+        return pose, model_aligned, best["scale"]
 
 
 # =============================================================================
-# 7. 재투영 검증
+# Result validation / export
 # =============================================================================
+
 
 class PoseValidator:
-
     @staticmethod
     def reprojection_check(
         model_pcd: o3d.geometry.PointCloud,
         camera_data: CameraData,
         output_path: str,
     ):
-        """정합된 모델(cam0 좌표계)을 이미지에 재투영"""
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        K = camera_data.intrinsics.K
         pts = np.asarray(model_pcd.points)
+        if len(pts) == 0:
+            return
 
-        # cam0 → cam_i 변환
+        K = camera_data.intrinsics.K
         T_cam = np.linalg.inv(camera_data.T_to_cam0)
-        pts_hom = np.hstack([pts, np.ones((len(pts), 1))])
+        pts_hom = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float64)])
         pts_cam = (T_cam @ pts_hom.T)[:3]
 
-        # 투영
-        valid = pts_cam[2] > 0
+        valid = pts_cam[2] > 0.05
         proj = K @ pts_cam[:, valid]
-        u = (proj[0] / proj[2]).astype(int)
-        v = (proj[1] / proj[2]).astype(int)
+        u = (proj[0] / proj[2]).astype(np.int32)
+        v = (proj[1] / proj[2]).astype(np.int32)
 
         img = camera_data.color_img.copy()
         h, w = img.shape[:2]
@@ -1998,9 +1293,68 @@ class PoseValidator:
         print(f"  재투영 저장: {output_path}")
 
 
-# =============================================================================
-# 6. 결과 출력/저장
-# =============================================================================
+def save_estimation_manifest(
+    output_path: str,
+    data_dir: str,
+    capture_dir: str,
+    glb_path: str,
+    frame_id: str,
+    camera_data_list: list,
+    prepared_ref: Optional[PreparedReference],
+    used_auto_detect: bool,
+    used_roi: bool,
+):
+    manifest = {
+        "goal": "Estimate real-world scale and 6DoF pose from calibrated multiview RGB-D and an unscaled reference GLB.",
+        "inputs_used": {
+            "data_dir": data_dir,
+            "capture_dir": capture_dir,
+            "glb_path": glb_path,
+            "frame_id": frame_id,
+            "camera_intrinsics": [f"cam{cam.intrinsics.cam_id}" for cam in camera_data_list],
+            "camera_extrinsics": ["T_C0_C1", "T_C0_C2"],
+            "rgbd_images": [f"cam{cam.intrinsics.cam_id}: rgb/depth" for cam in camera_data_list],
+        },
+        "manual_real_world_measurements_used": False,
+        "inference_sources": [
+            "Depth point cloud reconstructed from calibrated RGB-D images",
+            "Camera intrinsics and fixed-camera extrinsics",
+            "Reference GLB geometry sampled as a point cloud",
+        ],
+        "pipeline_modes": {
+            "auto_detect": bool(used_auto_detect),
+            "roi_used": bool(used_roi),
+            "reference_auto_prepare": prepared_ref is not None,
+        },
+    }
+    if prepared_ref is not None:
+        manifest["reference_auto_prepare"] = {
+            "estimated_object_longest_m": prepared_ref.estimated_size_m,
+            "estimated_object_longest_mm": None if prepared_ref.estimated_size_m is None else float(prepared_ref.estimated_size_m * 1000.0),
+            "original_reference_longest_m": float(prepared_ref.original_longest_m),
+            "reference_prep_scale": float(prepared_ref.prep_scale),
+            "reference_center_shift_m": prepared_ref.original_center.tolist(),
+        }
+
+    with open(output_path, "w") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    print(f"  추정 입력 요약 저장: {output_path}")
+
+
+def _output_unit_factor(output_unit: str) -> float:
+    unit = str(output_unit).strip().lower()
+    if unit == "mm":
+        return 1000.0
+    if unit == "m":
+        return 1.0
+    raise ValueError(f"지원하지 않는 output unit: {output_unit}")
+
+
+def _transform_with_scaled_translation(T: np.ndarray, factor: float) -> np.ndarray:
+    T_scaled = np.asarray(T, dtype=np.float64).copy()
+    T_scaled[:3, 3] *= factor
+    return T_scaled
+
 
 def print_pose(result: PoseResult):
     print(f"\n{'='*60}")
@@ -2011,51 +1365,69 @@ def print_pose(result: PoseResult):
     print(f"  위치: ({t[0]:+.4f}, {t[1]:+.4f}, {t[2]:+.4f}) m")
     print(f"  회전: ({e[0]:+.1f}°, {e[1]:+.1f}°, {e[2]:+.1f}°)")
     print(
-        f"  품질: fitness={result.fitness:.4f}, coverage={result.coverage:.4f}, "
-        f"RMSE={result.rmse:.6f}m, edge={result.edge_cost_px:.2f}px, "
-        f"obs={result.observation_score:.3f}, mesh={result.mesh_render_score:.3f}, "
-        f"desc={result.descriptor_score:.3f}"
+        f"  품질: score={result.score:.4f}, depth={result.depth_score:.4f}, "
+        f"coverage={result.coverage:.4f}, fitness={result.fitness:.4f}, "
+        f"RMSE={result.rmse:.6f}m, scale={result.scale:.4f}"
     )
 
 
 def save_pose(result: PoseResult, output_path: str):
+    transform_4x4_mm = _transform_with_scaled_translation(result.transform_4x4, 1000.0)
     np.savez(
         output_path,
         translation=result.translation,
+        translation_mm=result.translation * 1000.0,
         rotation_matrix=result.rotation_matrix,
         euler_xyz_deg=result.euler_xyz_deg,
         quaternion_xyzw=result.quaternion_xyzw,
         transform_4x4=result.transform_4x4,
-        fitness=result.fitness,
+        transform_4x4_mm=transform_4x4_mm,
+        scale=result.scale,
+        score=result.score,
+        depth_score=result.depth_score,
         coverage=result.coverage,
+        fitness=result.fitness,
         rmse=result.rmse,
-        edge_cost_px=result.edge_cost_px,
-        observation_score=result.observation_score,
-        mesh_render_score=result.mesh_render_score,
-        descriptor_score=result.descriptor_score,
         method=result.method,
     )
     print(f"  포즈 저장: {output_path}")
 
 
-def save_sim_config(result: PoseResult, model_pcd: o3d.geometry.PointCloud,
-                    output_path: str):
-    """시뮬레이션 프로그램용 JSON 파일 저장.
-    OpenCV 좌표계 (cam0 기준): X→오른쪽, Y→아래, Z→앞.
-    """
-    import json
-
+def save_sim_config(
+    result: PoseResult,
+    model_pcd: o3d.geometry.PointCloud,
+    output_path: str,
+    output_unit: str = "mm",
+):
+    factor = _output_unit_factor(output_unit)
+    unit_name = "millimeter" if factor == 1000.0 else "meter"
     obb = model_pcd.get_oriented_bounding_box()
-    extent = np.sort(obb.extent)[::-1]  # [L, W, H] 내림차순
-
+    extent = np.sort(obb.extent)[::-1]
     t = result.translation
     e = result.euler_xyz_deg
-    q = result.quaternion_xyzw  # [x, y, z, w]
+    q = result.quaternion_xyzw
+    T_out = result.transform_4x4
+
+    t_out = t * factor
+    extent_out = extent * factor
+    obb_center_out = obb.center * factor
+    T_out_scaled = _transform_with_scaled_translation(T_out, factor)
+    T_out_mm = _transform_with_scaled_translation(T_out, 1000.0)
 
     config = {
         "coordinate_frame": "OpenCV (cam0 ref): X-right, Y-down, Z-forward",
-        "unit": "meter / degree",
+        "unit": f"{unit_name} / degree",
         "position": {
+            "x": round(float(t_out[0]), 3 if factor == 1000.0 else 6),
+            "y": round(float(t_out[1]), 3 if factor == 1000.0 else 6),
+            "z": round(float(t_out[2]), 3 if factor == 1000.0 else 6),
+        },
+        "position_mm": {
+            "x": round(float(t[0] * 1000.0), 3),
+            "y": round(float(t[1] * 1000.0), 3),
+            "z": round(float(t[2] * 1000.0), 3),
+        },
+        "position_m": {
             "x": round(float(t[0]), 6),
             "y": round(float(t[1]), 6),
             "z": round(float(t[2]), 6),
@@ -2072,7 +1444,20 @@ def save_sim_config(result: PoseResult, model_pcd: o3d.geometry.PointCloud,
             "w": round(float(q[3]), 6),
         },
         "rotation_matrix_3x3": result.rotation_matrix.tolist(),
-        "transform_4x4": result.transform_4x4.tolist(),
+        "transform_4x4": T_out_scaled.tolist(),
+        "transform_4x4_mm": T_out_mm.tolist(),
+        "transform_4x4_m": T_out.tolist(),
+        "scale_uniform": float(result.scale),
+        "size": {
+            "length": round(float(extent_out[0]), 3 if factor == 1000.0 else 4),
+            "width": round(float(extent_out[1]), 3 if factor == 1000.0 else 4),
+            "height": round(float(extent_out[2]), 3 if factor == 1000.0 else 4),
+        },
+        "size_mm": {
+            "length": round(float(extent[0] * 1000.0), 3),
+            "width": round(float(extent[1] * 1000.0), 3),
+            "height": round(float(extent[2] * 1000.0), 3),
+        },
         "size_cm": {
             "length": round(float(extent[0] * 100), 2),
             "width": round(float(extent[1] * 100), 2),
@@ -2084,20 +1469,23 @@ def save_sim_config(result: PoseResult, model_pcd: o3d.geometry.PointCloud,
             "height": round(float(extent[2]), 4),
         },
         "obb_center": {
-            "x": round(float(obb.center[0]), 6),
-            "y": round(float(obb.center[1]), 6),
-            "z": round(float(obb.center[2]), 6),
+            "x": round(float(obb_center_out[0]), 3 if factor == 1000.0 else 6),
+            "y": round(float(obb_center_out[1]), 3 if factor == 1000.0 else 6),
+            "z": round(float(obb_center_out[2]), 3 if factor == 1000.0 else 6),
         },
-        "fitness": round(result.fitness, 4),
-        "coverage": round(result.coverage, 4),
-        "rmse_m": round(result.rmse, 6),
-        "edge_cost_px": round(float(result.edge_cost_px), 3),
-        "observation_score": round(float(result.observation_score), 4),
-        "mesh_render_score": round(float(result.mesh_render_score), 4),
-        "descriptor_score": round(float(result.descriptor_score), 4),
+        "obb_center_mm": {
+            "x": round(float(obb.center[0] * 1000.0), 3),
+            "y": round(float(obb.center[1] * 1000.0), 3),
+            "z": round(float(obb.center[2] * 1000.0), 3),
+        },
+        "score": round(float(result.score), 6),
+        "depth_score": round(float(result.depth_score), 6),
+        "coverage": round(float(result.coverage), 6),
+        "fitness": round(float(result.fitness), 6),
+        "rmse_m": round(float(result.rmse), 6),
     }
 
-    with open(output_path, 'w') as f:
+    with open(output_path, "w") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     print(f"  SIM 설정 저장: {output_path}")
 
@@ -2109,13 +1497,8 @@ def save_aligned_glb(
     scale: float,
     output_path: str,
     transform_mode: str = "bake",
+    output_unit: str = "mm",
 ):
-    """원본 GLB에 scale + pose를 반영한 cam0 좌표계 기준 GLB 저장.
-
-    transform_mode:
-      - "bake": 정점 좌표에 직접 반영 (mesh bake)
-      - "node": 노드 transform(matrix)에 반영
-    """
     src_path = Path(source_glb_path)
     if not src_path.exists():
         print(f"  [WARNING] 정합 GLB 저장 생략: 입력 GLB 없음 ({src_path})")
@@ -2138,7 +1521,10 @@ def save_aligned_glb(
     scale_T[:3, :3] *= float(scale)
 
     pose_T = np.asarray(pose.transform_4x4, dtype=np.float64)
-    export_T = pose_T @ scale_T @ center_T
+    unit_factor = _output_unit_factor(output_unit)
+    unit_T = np.eye(4)
+    unit_T[:3, :3] *= unit_factor
+    export_T = unit_T @ pose_T @ scale_T @ center_T
     mode = str(transform_mode).lower().strip()
     if mode == "node":
         for node_name in list(scene.graph.nodes_geometry):
@@ -2147,10 +1533,13 @@ def save_aligned_glb(
         scene.metadata = dict(scene.metadata or {})
         scene.metadata["rb_pose_cam0"] = {
             "transform_4x4": pose.transform_4x4.tolist(),
+            "transform_4x4_mm": _transform_with_scaled_translation(pose.transform_4x4, 1000.0).tolist(),
             "scale_uniform": float(scale),
             "translation_xyz_m": pose.translation.tolist(),
+            "translation_xyz_mm": (pose.translation * 1000.0).tolist(),
             "rotation_quaternion_xyzw": pose.quaternion_xyzw.tolist(),
             "rotation_euler_xyz_deg": pose.euler_xyz_deg.tolist(),
+            "output_unit": output_unit,
         }
     else:
         scene.apply_transform(export_T)
@@ -2160,36 +1549,9 @@ def save_aligned_glb(
     print(f"  정합 GLB 저장({mode}): {output_path}")
 
 
-def validate_identity_confidence(
-    pose: PoseResult,
-    args,
-    proposal_score: Optional[float] = None,
-    second_score: Optional[float] = None,
-):
-    issues = []
-    if pose.fitness < float(args.min_fitness_identity):
-        issues.append(f"fitness {pose.fitness:.3f} < {args.min_fitness_identity:.3f}")
-    if pose.coverage < float(args.min_coverage_identity):
-        issues.append(f"coverage {pose.coverage:.3f} < {args.min_coverage_identity:.3f}")
-    if pose.observation_score < float(args.min_obs_score_identity):
-        issues.append(f"obs {pose.observation_score:.3f} < {args.min_obs_score_identity:.3f}")
-    if pose.mesh_render_score < float(args.min_mesh_score_identity):
-        issues.append(f"mesh {pose.mesh_render_score:.3f} < {args.min_mesh_score_identity:.3f}")
-    if pose.descriptor_score < float(args.min_desc_score_identity):
-        issues.append(f"desc {pose.descriptor_score:.3f} < {args.min_desc_score_identity:.3f}")
-
-    if proposal_score is not None and second_score is not None and second_score > 0:
-        margin = float(proposal_score) / float(second_score)
-        if margin < float(args.min_proposal_margin):
-            issues.append(f"proposal margin {margin:.3f} < {args.min_proposal_margin:.3f}")
-
-    if issues:
-        detail = "; ".join(issues)
-        raise RuntimeError(
-            "참조 GLB와 동일 물체로 확신하기 어려운 결과입니다. "
-            f"({detail})  "
-            "ROI를 지정하거나 프레임을 바꾸거나 threshold를 완화해 주세요."
-        )
+# =============================================================================
+# Helpers
+# =============================================================================
 
 
 def list_available_frame_ids(data_dir: str) -> list:
@@ -2239,21 +1601,17 @@ def parse_frame_search_spec(spec: Optional[str], available_ids: list) -> list:
     for fid in available_ids:
         if fid in wanted_raw:
             filtered.append(fid)
-            continue
-        if fid.isdigit() and int(fid) in wanted_int:
+        elif fid.isdigit() and int(fid) in wanted_int:
             filtered.append(fid)
     return filtered
 
 
+def pose_confidence_score(pose: PoseResult) -> float:
+    return float(max(pose.score, 1e-6) * max(0.25, pose.fitness))
+
+
 def identity_confidence_score(pose: PoseResult) -> float:
-    return float(
-        pose.fitness
-        * max(pose.coverage, 1e-4)
-        * max(pose.observation_score, 1e-4)
-        * max(pose.mesh_render_score, 1e-4)
-        * max(pose.descriptor_score, 1e-4)
-        / (1.0 + pose.edge_cost_px / 20.0)
-    )
+    return pose_confidence_score(pose)
 
 
 def parse_roi_arg(roi_str: str) -> Tuple[int, int, int, int]:
@@ -2286,15 +1644,11 @@ def save_roi_debug(color_img: np.ndarray, roi: Tuple[int, int, int, int], output
 def estimate_pose_with_proposals(
     objects_pcd: o3d.geometry.PointCloud,
     ref_pcd: o3d.geometry.PointCloud,
+    ref_mesh: Optional[trimesh.Trimesh],
     proposals: list,
     camera_data_list: list,
     args,
-    edge_context: Optional[Dict[str, list]] = None,
-    observation_context: Optional[Dict[str, list]] = None,
-    mesh_render_context: Optional[Dict[str, list]] = None,
 ):
-    if edge_context is None:
-        edge_context = PoseRefiner2D.build_edge_context(camera_data_list)
     best = None
     best_total = -1.0
     second_best_total = -1.0
@@ -2315,45 +1669,22 @@ def estimate_pose_with_proposals(
                 voxel_size=args.voxel_size,
                 object_size_m=getattr(args, "object_size_m", None),
                 camera_data_list=camera_data_list,
-                edge_context=edge_context,
-                observation_context=observation_context,
-                mesh_render_context=mesh_render_context,
+                ref_mesh=ref_mesh,
+                ref_sample_points=getattr(args, "ref_sample_points", 12000),
+                max_scale_candidates=getattr(args, "max_scale_candidates", 8),
+                max_pca_candidates=getattr(args, "max_pca_candidates", 8),
+                narrow_scale_search=getattr(args, "narrow_scale_search", False),
             )
         except Exception as exc:
             print(f"    [skip] proposal 정합 실패: {exc}")
             continue
 
-        edge_cost_i, vis_i = PoseRefiner2D.projection_edge_cost(
-            np.asarray(model_i.points),
-            edge_context,
-            sample_size=1500,
-        )
-        obs_score_i = 1.0
-        obs_detail_i = {"mask": 1.0, "depth": 1.0, "depth_err_mm": 0.0}
-        if observation_context is not None:
-            obs_score_i, obs_detail_i = PoseRefiner2D.projection_observation_score(
-                np.asarray(model_i.points),
-                observation_context,
-                sample_size=5000,
-            )
-        mesh_score_i = float(getattr(pose_i, "mesh_render_score", 1.0))
-        desc_score_i = float(getattr(pose_i, "descriptor_score", 0.0))
-        det_norm = prop.score / max(max_prop_score, 1e-6)
-        total_i = float(
-            pose_i.fitness
-            * max(pose_i.coverage, 1e-3)
-            * ((0.20 + 0.80 * desc_score_i) ** 2)
-            * np.exp(-edge_cost_i / 10.0)
-            * np.clip(vis_i / 0.10, 0.2, 1.0)
-            * ((0.20 + 0.80 * obs_score_i) ** 2)
-            * ((0.15 + 0.85 * mesh_score_i) ** 2)
-            * (0.85 + 0.15 * det_norm)
-        )
+        det_norm = float(prop.score) / max(float(max_prop_score), 1e-6)
+        total_i = float(pose_i.score * (0.90 + 0.10 * det_norm))
         print(
             f"    detector_score={det_norm:.3f}  "
-            f"pose_fitness={pose_i.fitness:.4f}  coverage={pose_i.coverage:.4f}  edge={edge_cost_i:.2f}px  "
-            f"obs={obs_score_i:.3f} mask={obs_detail_i['mask']:.3f} depth={obs_detail_i['depth']:.3f}  "
-            f"mesh={mesh_score_i:.3f} desc={desc_score_i:.3f}  "
+            f"pose_score={pose_i.score:.4f} depth={pose_i.depth_score:.4f} "
+            f"coverage={pose_i.coverage:.4f} fitness={pose_i.fitness:.4f}  "
             f"total={total_i:.4f}"
         )
 
@@ -2378,8 +1709,9 @@ def estimate_pose_with_proposals(
 
 
 # =============================================================================
-# 7. 메인 파이프라인
+# Main pipeline
 # =============================================================================
+
 
 def run_pipeline(args):
     print("=" * 60)
@@ -2387,7 +1719,6 @@ def run_pipeline(args):
     print("=" * 60)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # --- 데이터 로드 ---
     print("\n[1/5] 데이터 로드")
     loader = DataLoader(
         data_dir=args.data_dir,
@@ -2395,7 +1726,6 @@ def run_pipeline(args):
         extrinsics_dir=args.extrinsics_dir,
         glb_path=args.glb_path,
     )
-
     intrinsics = [loader.load_intrinsics(i) for i in range(args.num_cameras)]
     extrinsics = loader.load_extrinsics()
 
@@ -2407,13 +1737,14 @@ def run_pipeline(args):
             T_to_cam0 = extrinsics["T_C0_C1"]
         elif i == 2 and "T_C0_C2" in extrinsics:
             T_to_cam0 = extrinsics["T_C0_C2"]
-
-        camera_data_list.append(CameraData(
-            intrinsics=intrinsics[i],
-            color_img=color,
-            depth_img=depth,
-            T_to_cam0=T_to_cam0,
-        ))
+        camera_data_list.append(
+            CameraData(
+                intrinsics=intrinsics[i],
+                color_img=color,
+                depth_img=depth,
+                T_to_cam0=T_to_cam0,
+            )
+        )
 
     roi = None
     if args.roi is not None:
@@ -2429,14 +1760,9 @@ def run_pipeline(args):
             os.path.join(args.output_dir, f"roi_cam0_{args.frame_id}.png"),
         )
 
-    # --- 점군 통합 ---
     print("\n[2/5] 점군 통합")
-    merged_pcd = PointCloudProcessor.merge_pointclouds(
-        camera_data_list, voxel_size=args.voxel_size
-    )
-    o3d.io.write_point_cloud(
-        os.path.join(args.output_dir, "scene_merged.ply"), merged_pcd
-    )
+    merged_pcd = PointCloudProcessor.merge_pointclouds(camera_data_list, voxel_size=args.voxel_size)
+    o3d.io.write_point_cloud(os.path.join(args.output_dir, "scene_merged.ply"), merged_pcd)
 
     if roi is not None:
         print("\n[2.5/5] ROI 기반 3D crop")
@@ -2450,11 +1776,8 @@ def run_pipeline(args):
         merged_pcd = PointCloudProcessor.filter_by_3d_box(merged_pcd, min_xyz, max_xyz)
         if len(merged_pcd.points) == 0:
             raise RuntimeError("ROI crop 이후 점군이 비었습니다. ROI를 조금 넓혀주세요.")
-        o3d.io.write_point_cloud(
-            os.path.join(args.output_dir, "scene_merged_roi.ply"), merged_pcd
-        )
+        o3d.io.write_point_cloud(os.path.join(args.output_dir, "scene_merged_roi.ply"), merged_pcd)
 
-    # --- 테이블 제거 ---
     print("\n[3/5] 테이블 평면 제거")
     objects_pcd, table_plane = PointCloudProcessor.remove_table_plane(merged_pcd)
     objects_pcd = PointCloudProcessor.filter_by_plane_height(
@@ -2465,17 +1788,7 @@ def run_pipeline(args):
     )
     if len(objects_pcd.points) == 0:
         raise RuntimeError("테이블 높이 필터 이후 남은 점이 없습니다. max_height_m 값을 늘려보세요.")
-    o3d.io.write_point_cloud(
-        os.path.join(args.output_dir, "objects_no_table.ply"), objects_pcd
-    )
-
-    edge_context = PoseRefiner2D.build_edge_context(camera_data_list)
-    observation_context = PoseRefiner2D.build_observation_context(
-        camera_data_list,
-        plane_model=table_plane,
-        min_height=args.min_height_m,
-        max_height=args.max_height_m,
-    )
+    o3d.io.write_point_cloud(os.path.join(args.output_dir, "objects_no_table.ply"), objects_pcd)
 
     proposals = []
     if roi is None and not args.disable_auto_detect:
@@ -2510,131 +1823,175 @@ def run_pipeline(args):
                 f"roi=({x1},{y1},{x2},{y2}) area={prop.area_px}px score={prop.score:.1f}"
             )
 
-    # --- 포즈 추정 (크기 기반 자동 클러스터 선택 + ICP) ---
     print("\n[4/5] 포즈 추정")
-    ref_pcd = loader.load_reference_pcd()
-    ref_mesh = loader.load_reference_mesh(print_info=not bool(getattr(args, "disable_mesh_render_score", False)))
-    mesh_render_context = None
-    if (not getattr(args, "disable_mesh_render_score", False)) and ref_mesh is not None:
-        ref_center = np.asarray(ref_pcd.points).mean(axis=0) if len(ref_pcd.points) > 0 else np.zeros(3)
-        mesh_render_context = PoseRefiner2D.build_mesh_render_context(
-            ref_mesh,
-            ref_center,
-            observation_context,
-            render_scale=getattr(args, "mesh_render_scale", 0.5),
-            max_faces=getattr(args, "mesh_render_max_faces", 3000),
+    ref_pcd_orig = loader.load_reference_pcd()
+    ref_mesh_orig = loader.load_reference_mesh(print_info=True)
+
+    prepared_ref = None
+    ref_pcd_match = ref_pcd_orig
+    ref_mesh_match = ref_mesh_orig
+    matching_object_size_m = None
+    matching_narrow_scale_search = getattr(args, "narrow_scale_search", False)
+
+    if not getattr(args, "disable_auto_prepare_ref", False):
+        estimated_size_m = ReferencePreprocessor.estimate_object_size_m(
+            objects_pcd,
+            proposals=proposals,
+            min_points=args.detector_min_points,
         )
+        if estimated_size_m is not None:
+            print(f"  [AUTO] 촬영 이미지 기반 object size 추정: {estimated_size_m*1000:.1f} mm")
+        else:
+            print("  [AUTO] object size 자동 추정 실패 -> center-only reference 준비")
+
+        prepared_ref = ReferencePreprocessor.prepare_reference(
+            ref_pcd_orig,
+            ref_mesh_orig,
+            output_dir=args.output_dir,
+            target_size_m=estimated_size_m,
+            save_glb=not getattr(args, "disable_save_prepared_ref", False),
+        )
+        ref_pcd_match = prepared_ref.pcd
+        ref_mesh_match = prepared_ref.mesh
+        matching_object_size_m = None
+        if estimated_size_m is not None:
+            matching_narrow_scale_search = True
+
     proposal_score = None
     second_score = None
     if proposals:
-        best = estimate_pose_with_proposals(
-            objects_pcd,
-            ref_pcd,
-            proposals,
-            camera_data_list,
-            args,
-            edge_context=edge_context,
-            observation_context=observation_context,
-            mesh_render_context=mesh_render_context,
-        )
-        pose = best["pose"]
-        model_aligned = best["model"]
-        scale = best["scale"]
-        proposal_score = best.get("score", None)
-        second_score = best.get("second_score", None)
-        prop = best["proposal"]
-        x1, y1, x2, y2 = prop.roi
-        print(
-            f"  선택된 proposal {prop.proposal_id}: "
-            f"roi=({x1},{y1},{x2},{y2})  total_score={best['score']:.4f}"
-        )
-        o3d.io.write_point_cloud(
-            os.path.join(args.output_dir, "detector_selected_crop.ply"),
-            best["cropped_pcd"],
-        )
+        try:
+            best = estimate_pose_with_proposals(
+                objects_pcd,
+                ref_pcd_match,
+                ref_mesh_match,
+                proposals,
+                camera_data_list,
+                argparse.Namespace(
+                    **{
+                        **vars(args),
+                        "object_size_m": matching_object_size_m,
+                        "narrow_scale_search": matching_narrow_scale_search,
+                    }
+                ),
+            )
+            pose = best["pose"]
+            model_aligned = best["model"]
+            scale = best["scale"]
+            proposal_score = best.get("score")
+            second_score = best.get("second_score")
+            prop = best["proposal"]
+            x1, y1, x2, y2 = prop.roi
+            print(
+                f"  선택된 proposal {prop.proposal_id}: "
+                f"roi=({x1},{y1},{x2},{y2})  total_score={best['score']:.4f}"
+            )
+            o3d.io.write_point_cloud(
+                os.path.join(args.output_dir, "detector_selected_crop.ply"),
+                best["cropped_pcd"],
+            )
+        except Exception as exc:
+            print(f"  [WARNING] proposal 기반 정합 실패 -> 전체 object cloud로 fallback: {exc}")
+            pose, model_aligned, scale = PoseEstimator.estimate_pose(
+                objects_pcd,
+                ref_pcd_match,
+                voxel_size=args.voxel_size,
+                object_size_m=matching_object_size_m,
+                camera_data_list=camera_data_list,
+                ref_mesh=ref_mesh_match,
+                ref_sample_points=getattr(args, "ref_sample_points", 12000),
+                max_scale_candidates=getattr(args, "max_scale_candidates", 8),
+                max_pca_candidates=getattr(args, "max_pca_candidates", 8),
+                narrow_scale_search=matching_narrow_scale_search,
+            )
     else:
+        if args.disable_auto_detect and roi is None:
+            print("  [INFO] 자동 detector 비활성화 -> 전체 object cloud에 대해 직접 정합")
         pose, model_aligned, scale = PoseEstimator.estimate_pose(
-            objects_pcd, ref_pcd, voxel_size=args.voxel_size,
-            object_size_m=getattr(args, "object_size_m", None),
+            objects_pcd,
+            ref_pcd_match,
+            voxel_size=args.voxel_size,
+            object_size_m=matching_object_size_m,
             camera_data_list=camera_data_list,
-            edge_context=edge_context,
-            observation_context=observation_context,
-            mesh_render_context=mesh_render_context,
+            ref_mesh=ref_mesh_match,
+            ref_sample_points=getattr(args, "ref_sample_points", 12000),
+            max_scale_candidates=getattr(args, "max_scale_candidates", 8),
+            max_pca_candidates=getattr(args, "max_pca_candidates", 8),
+            narrow_scale_search=matching_narrow_scale_search,
         )
+
+    if prepared_ref is not None:
+        scale *= prepared_ref.prep_scale
+        pose.scale = float(scale)
     print_pose(pose)
 
-    # --- 2D 엣지 정밀화 ---
-    if not args.no_refine_2d:
-        print("\n[4.5/5] 2D 엣지 정밀화")
-        pose, model_aligned = PoseRefiner2D.refine(
-            model_aligned, pose, camera_data_list,
-            n_samples=2000,
-            n_iter=getattr(args, "refine_2d_iter", 800),
-            search_r=getattr(args, "refine_2d_search_r", 0.02),
-            rot_deg=getattr(args, "refine_2d_rot_deg", 20.0),
-            output_dir=args.output_dir,
-        )
-        print_pose(pose)
-    else:
-        print("\n[4.5/5] 2D 엣지 정밀화 생략 (--no_refine_2d)")
-
-    if not getattr(args, "disable_strict_identity", False):
-        print("\n[4.6/5] Identity 신뢰도 검증")
-        validate_identity_confidence(
-            pose,
-            args,
-            proposal_score=proposal_score,
-            second_score=second_score,
-        )
-        print("  strict identity 검증 통과")
-
-    # 정합 결과 저장
     combined = merged_pcd + model_aligned
-    o3d.io.write_point_cloud(
-        os.path.join(args.output_dir, "alignment_result.ply"), combined
-    )
-    o3d.io.write_point_cloud(
-        os.path.join(args.output_dir, "object_pointcloud.ply"), model_aligned
-    )
+    o3d.io.write_point_cloud(os.path.join(args.output_dir, "alignment_result.ply"), combined)
+    o3d.io.write_point_cloud(os.path.join(args.output_dir, "object_pointcloud.ply"), model_aligned)
 
-    # --- 검증 및 저장 ---
     print("\n[5/5] 검증 및 저장")
-    os.makedirs(args.output_dir, exist_ok=True)
     save_pose(pose, os.path.join(args.output_dir, "pose_Reference_Matching.npz"))
-    save_sim_config(pose, model_aligned,
-                    os.path.join(args.output_dir, "object_pose_sim.json"))
+    save_estimation_manifest(
+        os.path.join(args.output_dir, "estimation_manifest.json"),
+        data_dir=args.data_dir,
+        capture_dir=str(loader.image_dir),
+        glb_path=str(loader.glb_path),
+        frame_id=args.frame_id,
+        camera_data_list=camera_data_list,
+        prepared_ref=prepared_ref,
+        used_auto_detect=(roi is None and not args.disable_auto_detect),
+        used_roi=(roi is not None),
+    )
+    save_sim_config(
+        pose,
+        model_aligned,
+        os.path.join(args.output_dir, "object_pose_sim.json"),
+        output_unit=args.output_unit,
+    )
     save_aligned_glb(
         str(loader.glb_path),
-        ref_pcd,
+        ref_pcd_orig,
         pose,
         scale,
         os.path.join(args.output_dir, "aligned_object.glb"),
         transform_mode="bake",
+        output_unit=args.output_unit,
     )
     save_aligned_glb(
         str(loader.glb_path),
-        ref_pcd,
+        ref_pcd_orig,
         pose,
         scale,
         os.path.join(args.output_dir, "aligned_object_node.glb"),
         transform_mode="node",
+        output_unit=args.output_unit,
     )
 
     for cam_data in camera_data_list:
         cam_id = cam_data.intrinsics.cam_id
         PoseValidator.reprojection_check(
-            model_aligned, cam_data,
+            model_aligned,
+            cam_data,
             os.path.join(args.output_dir, f"reprojection_cam{cam_id}.png"),
         )
 
+    if proposal_score is not None:
+        summary = {
+            "proposal_score": proposal_score,
+            "second_score": second_score,
+            "proposal_margin": float(proposal_score / second_score) if second_score and second_score > 0 else None,
+        }
+        with open(os.path.join(args.output_dir, "proposal_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"  proposal 요약 저장: {os.path.join(args.output_dir, 'proposal_summary.json')}")
+
     print(f"\n  결과 저장 위치: {args.output_dir}/")
 
-    # --- 시각화 ---
     if args.visualize:
         print("\n[6] 시각화")
-        import subprocess
         vis_script = os.path.join(os.path.dirname(__file__), "Obj_Step3_visualize_pose_result.py")
-        subprocess.run([sys.executable, vis_script])
+        subprocess.run([sys.executable, vis_script], check=False)
+
     print("=" * 60)
     return {
         "pose": pose,
@@ -2674,28 +2031,32 @@ def run_auto_best_frame(args):
         try:
             res = run_pipeline(sub_args)
             pose = res["pose"]
-            conf = identity_confidence_score(pose)
-            all_results.append({
-                "frame_id": fid,
-                "status": "ok",
-                "confidence": conf,
-                "pose": pose,
-                "output_dir": sub_args.output_dir,
-            })
+            conf = pose_confidence_score(pose)
+            all_results.append(
+                {
+                    "frame_id": fid,
+                    "status": "ok",
+                    "confidence": conf,
+                    "pose": pose,
+                    "output_dir": sub_args.output_dir,
+                }
+            )
             print(
                 f"[AUTO] frame {fid} 성공  "
-                f"conf={conf:.6f}  fit={pose.fitness:.4f} cov={pose.coverage:.4f}  "
-                f"obs={pose.observation_score:.3f} mesh={pose.mesh_render_score:.3f} desc={pose.descriptor_score:.3f}"
+                f"conf={conf:.6f}  score={pose.score:.4f}  "
+                f"depth={pose.depth_score:.4f} cov={pose.coverage:.4f} fit={pose.fitness:.4f}"
             )
             if getattr(args, "auto_stop_on_first", False):
                 break
         except Exception as exc:
-            all_results.append({
-                "frame_id": fid,
-                "status": "fail",
-                "error": str(exc),
-                "output_dir": sub_args.output_dir,
-            })
+            all_results.append(
+                {
+                    "frame_id": fid,
+                    "status": "fail",
+                    "error": str(exc),
+                    "output_dir": sub_args.output_dir,
+                }
+            )
             print(f"[AUTO] frame {fid} 실패: {exc}")
 
     ok_results = [r for r in all_results if r["status"] == "ok"]
@@ -2717,6 +2078,7 @@ def run_auto_best_frame(args):
             "reprojection_cam0.png",
             "reprojection_cam1.png",
             "reprojection_cam2.png",
+            "proposal_summary.json",
         ]
         for name in copy_names:
             src = os.path.join(best_dir, name)
@@ -2739,15 +2101,16 @@ def run_auto_best_frame(args):
         }
         if r["status"] == "ok":
             p = r["pose"]
-            item.update({
-                "confidence": r["confidence"],
-                "fitness": p.fitness,
-                "coverage": p.coverage,
-                "edge_cost_px": p.edge_cost_px,
-                "observation_score": p.observation_score,
-                "mesh_render_score": p.mesh_render_score,
-                "descriptor_score": p.descriptor_score,
-            })
+            item.update(
+                {
+                    "confidence": r["confidence"],
+                    "score": p.score,
+                    "depth_score": p.depth_score,
+                    "coverage": p.coverage,
+                    "fitness": p.fitness,
+                    "rmse": p.rmse,
+                }
+            )
         else:
             item["error"] = r.get("error", "")
         summary["results"].append(item)
@@ -2760,12 +2123,11 @@ def run_auto_best_frame(args):
     print("[AUTO] 실행 요약")
     print("=" * 60)
     if best is not None:
-        best_dir = best["output_dir"]
         print(f"  선택 프레임: {best['frame_id']}")
         print(f"  confidence: {best['confidence']:.6f}")
-        print(f"  원본 결과 위치: {best_dir}")
+        print(f"  원본 결과 위치: {best['output_dir']}")
     else:
-        print("  선택 프레임: 없음 (strict identity 통과 실패)")
+        print("  선택 프레임: 없음")
     print(f"  최종 결과 위치: {final_dir}")
     print(f"  요약 저장: {summary_path}")
     print("=" * 60)
@@ -2777,81 +2139,92 @@ def run_auto_best_frame(args):
     }
 
 
-# =============================================================================
-# 실행
-# =============================================================================
-
-if __name__ == "__main__":
-    _script_dir = Path(__file__).resolve().parent
-    _default_data = str(_script_dir / "data")
-    _default_output = str(_script_dir / "output")
-    _default_ext = str(_script_dir / "data" / "cube_session_01" / "calib_out_cube")
-    _default_glb = str(_script_dir / "data" / "reference_knife.glb")
+def build_arg_parser() -> argparse.ArgumentParser:
+    script_dir = Path(__file__).resolve().parent
+    default_data = str(script_dir / "data")
+    default_output = str(script_dir / "output")
+    default_ext = str(script_dir / "data" / "cube_session_01" / "calib_out_cube")
+    default_glb = str(script_dir / "data" / "reference_knife.glb")
 
     parser = argparse.ArgumentParser(description="멀티뷰 RGB-D 기반 물체 포즈 추정")
-    parser.add_argument("--data_dir", default=_default_data, help="데이터 디렉토리")
-    parser.add_argument("--output_dir", default=_default_output, help="결과 저장 디렉토리")
-    parser.add_argument("--extrinsics_dir", default=_default_ext, help="외부 파라미터 디렉토리")
-    parser.add_argument("--glb_path", default=_default_glb, help="GLB 모델 경로")
+    parser.add_argument("--data_dir", default=default_data, help="데이터 디렉토리")
+    parser.add_argument("--output_dir", default=default_output, help="결과 저장 디렉토리")
+    parser.add_argument("--extrinsics_dir", default=default_ext, help="외부 파라미터 디렉토리")
+    parser.add_argument("--glb_path", default=default_glb, help="GLB 모델 경로")
     parser.add_argument("--frame_id", default="000003", help="프레임 번호 (예: 000003)")
-    parser.add_argument("--frame_mode", choices=["single", "auto_best"], default="single",
-                        help="single: 단일 프레임 실행, auto_best: 여러 프레임 중 최고 신뢰 결과 선택")
-    parser.add_argument("--frame_search", type=str, default=None,
-                        help="auto_best 탐색 프레임 (예: 000000-000005 또는 000000,000003,000005)")
-    parser.add_argument("--auto_stop_on_first", action="store_true",
-                        help="auto_best에서 첫 성공 프레임 발견 즉시 중단")
+    parser.add_argument(
+        "--frame_mode",
+        choices=["single", "auto_best"],
+        default="single",
+        help="single: 단일 프레임 실행, auto_best: 여러 프레임 중 최고 신뢰 결과 선택",
+    )
+    parser.add_argument(
+        "--frame_search",
+        type=str,
+        default=None,
+        help="auto_best 탐색 프레임 (예: 000000-000005 또는 000000,000003,000005)",
+    )
+    parser.add_argument(
+        "--auto_stop_on_first",
+        action="store_true",
+        help="auto_best에서 첫 성공 프레임 발견 즉시 중단",
+    )
     parser.add_argument("--num_cameras", type=int, default=3, help="카메라 수")
     parser.add_argument("--voxel_size", type=float, default=0.003, help="복셀 크기 (m)")
+    parser.add_argument(
+        "--output_unit",
+        choices=["m", "mm"],
+        default="mm",
+        help="시뮬레이션 산출물(JSON/GLB) 저장 단위",
+    )
     parser.add_argument("--visualize", action="store_true", help="완료 후 시각화 자동 실행")
-    parser.add_argument("--roi_interactive", action="store_true",
-                        help="cam0 이미지에서 마우스로 ROI 선택")
-    parser.add_argument("--roi", type=str, default=None,
-                        help="ROI 픽셀 좌표 (cam0 기준): x1,y1,x2,y2")
-    parser.add_argument("--roi_margin_m", type=float, default=0.03,
-                        help="ROI를 3D box로 확장할 때 추가 여유(m)")
-    parser.add_argument("--object_size_m", type=float, default=None,
-                        help="물체 실제 최장변 길이(m). 지정 시 스케일 고정 (예: 0.05 = 5cm)")
-    parser.add_argument("--min_height_m", type=float, default=0.002,
-                        help="테이블 평면으로부터 최소 높이(m)")
-    parser.add_argument("--max_height_m", type=float, default=0.12,
-                        help="테이블 평면으로부터 최대 높이(m)")
-    parser.add_argument("--disable_auto_detect", action="store_true",
-                        help="ROI가 없을 때 자동 object detector 단계를 끔")
-    parser.add_argument("--detector_min_area_px", type=int, default=1200,
-                        help="자동 detector가 유지할 최소 2D 면적(px)")
-    parser.add_argument("--detector_max_proposals", type=int, default=6,
-                        help="자동 detector가 평가할 최대 proposal 수")
-    parser.add_argument("--detector_min_points", type=int, default=80,
-                        help="proposal crop이 가져야 하는 최소 점 수")
-    parser.add_argument("--disable_mesh_render_score", action="store_true",
-                        help="mesh z-buffer render 기반 점수를 끔")
-    parser.add_argument("--mesh_render_scale", type=float, default=0.5,
-                        help="mesh render 점수 계산용 이미지 축소 비율 (기본 0.5)")
-    parser.add_argument("--mesh_render_max_faces", type=int, default=3000,
-                        help="mesh render 점수 계산에 사용할 최대 face 수")
-    parser.add_argument("--disable_strict_identity", action="store_true",
-                        help="참조 GLB 동일물체 신뢰도 검증(strict identity)을 끔")
-    parser.add_argument("--min_fitness_identity", type=float, default=0.75,
-                        help="strict identity: 최소 fitness")
-    parser.add_argument("--min_coverage_identity", type=float, default=0.85,
-                        help="strict identity: 최소 coverage")
-    parser.add_argument("--min_obs_score_identity", type=float, default=0.03,
-                        help="strict identity: 최소 observation score")
-    parser.add_argument("--min_mesh_score_identity", type=float, default=0.05,
-                        help="strict identity: 최소 mesh render score")
-    parser.add_argument("--min_desc_score_identity", type=float, default=0.55,
-                        help="strict identity: 최소 shape descriptor score")
-    parser.add_argument("--min_proposal_margin", type=float, default=1.10,
-                        help="strict identity: best/second proposal score 최소 배수")
-    parser.add_argument("--no_refine_2d", action="store_true",
-                        help="2D 엣지 정밀화를 생략")
-    parser.add_argument("--refine_2d_iter", type=int, default=800,
-                        help="2D 엣지 정밀화 최대 반복 횟수 (기본 800)")
-    parser.add_argument("--refine_2d_search_r", type=float, default=0.02,
-                        help="2D 정밀화 위치 탐색 반경(m)")
-    parser.add_argument("--refine_2d_rot_deg", type=float, default=20.0,
-                        help="2D 정밀화 회전 탐색 범위(deg)")
+    parser.add_argument("--roi_interactive", action="store_true", help="cam0 이미지에서 마우스로 ROI 선택")
+    parser.add_argument("--roi", type=str, default=None, help="ROI 픽셀 좌표 (cam0 기준): x1,y1,x2,y2")
+    parser.add_argument("--roi_margin_m", type=float, default=0.03, help="ROI를 3D box로 확장할 때 추가 여유(m)")
+    parser.add_argument(
+        "--disable_auto_prepare_ref",
+        action="store_true",
+        help="촬영 이미지 기반 reference 중심/스케일 자동 준비를 끔",
+    )
+    parser.add_argument(
+        "--disable_save_prepared_ref",
+        action="store_true",
+        help="자동 준비된 reference GLB/정보 파일 저장을 생략",
+    )
+    parser.add_argument(
+        "--narrow_scale_search",
+        action="store_true",
+        help="scale 탐색 범위를 좁혀 더 빠르게 실행",
+    )
+    parser.add_argument(
+        "--ref_sample_points",
+        type=int,
+        default=12000,
+        help="레퍼런스 모델에서 사용할 점 수. 작을수록 빠르지만 정합 안정성은 다소 낮아질 수 있음",
+    )
+    parser.add_argument(
+        "--max_scale_candidates",
+        type=int,
+        default=8,
+        help="평가할 최대 scale 후보 수. 작을수록 빠름",
+    )
+    parser.add_argument(
+        "--max_pca_candidates",
+        type=int,
+        default=8,
+        help="scale마다 평가할 최대 PCA 회전 후보 수. 작을수록 빠름",
+    )
+    parser.add_argument("--min_height_m", type=float, default=0.002, help="테이블 평면으로부터 최소 높이(m)")
+    parser.add_argument("--max_height_m", type=float, default=0.12, help="테이블 평면으로부터 최대 높이(m)")
+    parser.add_argument("--disable_auto_detect", action="store_true", help="ROI가 없을 때 자동 object detector 단계를 끔")
+    parser.add_argument("--detector_min_area_px", type=int, default=1200, help="자동 detector가 유지할 최소 2D 면적(px)")
+    parser.add_argument("--detector_max_proposals", type=int, default=6, help="자동 detector가 평가할 최대 proposal 수")
+    parser.add_argument("--detector_min_points", type=int, default=80, help="proposal crop이 가져야 하는 최소 점 수")
+    return parser
 
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     if args.frame_mode == "auto_best":
