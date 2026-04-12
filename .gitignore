@@ -4,6 +4,7 @@ __pycache__/
 
 # Local environments
 .venv/
+.venv311/
 venv/
 
 # Large model artifacts

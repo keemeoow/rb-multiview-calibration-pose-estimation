@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(wc -l /Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/src/Obj_Step*.py /Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/src/Step0_calibration/*.py /Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/src/_camera.py)"
+      "Bash(wc -l /Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/src/Obj_Step*.py /Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/src/Step0_calibration/*.py /Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/src/_camera.py)",
+      "Bash(ls -lh src/output/pose_pipeline/*.glb)"
     ]
   }
 }
