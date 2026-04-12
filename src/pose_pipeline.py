@@ -88,8 +88,8 @@ DEPTH_POLICY = {
     "min_depth_m": 0.10, "max_depth_m": 1.20, "voxel_size_m": 0.002,
     "table_dist_thresh_m": 0.008,
     "object_min_height_m": 0.005, "object_max_height_m": 0.15,
-    "cluster_eps_m": 0.006, "cluster_min_pts": 50,
-    "cluster_min_extent_m": 0.012, "cluster_max_extent_m": 0.25,
+    "cluster_eps_m": 0.012, "cluster_min_pts": 100,
+    "cluster_min_extent_m": 0.015, "cluster_max_extent_m": 0.18,
 }
 
 # 프레임→GLB 고정 매핑 (단일 오브젝트 캡처)
@@ -186,6 +186,8 @@ def estimate_table_plane(frames):
     Returns:
         plane_n: (3,) unit normal
         plane_d: float  -> signed distance plane: n^T x + d = 0
+        table_center: (3,) 테이블 inlier 점군의 중심
+        table_radius: float 테이블 inlier 점군의 수평 반경
     """
     all_pts = []
     for cam in frames:
@@ -204,7 +206,7 @@ def estimate_table_plane(frames):
     if len(pcd.points) < 3:
         raise RuntimeError("테이블 평면 추정 실패: 유효 점군 부족")
 
-    plane, _ = pcd.segment_plane(
+    plane, inlier_idx = pcd.segment_plane(
         distance_threshold=DEPTH_POLICY["table_dist_thresh_m"],
         ransac_n=3,
         num_iterations=1000,
@@ -216,14 +218,25 @@ def estimate_table_plane(frames):
         raise RuntimeError("테이블 평면 추정 실패: normal norm too small")
     n /= n_norm
     d /= n_norm
-    return n, d
+
+    # 테이블 inlier 점의 수평(XZ) 중심 · 반경 계산 → 배경 제거용
+    table_pts = np.asarray(pcd.points)[inlier_idx]
+    table_center = table_pts.mean(axis=0)
+    horiz = np.array([table_pts[:, 0], table_pts[:, 2]]).T
+    tc_horiz = np.array([table_center[0], table_center[2]])
+    dists = np.linalg.norm(horiz - tc_horiz, axis=1)
+    table_radius = np.percentile(dists, 90) * 1.1  # 90th percentile + 10% 여유
+
+    return n, d, table_center, table_radius
 
 
-def build_observed_mask(cam: CameraFrame, plane_n, plane_d):
+def build_observed_mask(cam: CameraFrame, plane_n, plane_d, table_center=None, table_radius=None):
     """
     RGB-D 기반 실제 관측 마스크 생성.
     - 유효 depth
     - 테이블 위 점만 유지
+    - 테이블 영역(수평 XZ) 내부만 허용 → 배경 노이즈 제거
+    - 색상 채도 필터 (회색 테이블 vs 채색 물체)
     - morphology + connected components
     """
     h, w = cam.depth_u16.shape
@@ -261,13 +274,23 @@ def build_observed_mask(cam: CameraFrame, plane_n, plane_d):
         & (signed < DEPTH_POLICY["object_max_height_m"])
     )
 
+    # 테이블 수평 영역(XZ) 내부만 허용 → 배경 노이즈 차단
+    if table_center is not None and table_radius is not None:
+        horiz = np.array([pts_base[:, 0], pts_base[:, 2]]).T
+        tc = np.array([table_center[0], table_center[2]])
+        dist = np.linalg.norm(horiz - tc, axis=1)
+        keep &= (dist < table_radius)
+
     mask = np.zeros((h, w), dtype=np.uint8)
     mask[v_valid[keep], u_valid[keep]] = 255
 
+    # 색상 필터: 채색 물체 vs 무채색 배경(회색 테이블, 흰 벽)
     hsv = cv2.cvtColor(cam.color_bgr, cv2.COLOR_BGR2HSV)
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
-    rgb_fg = ((sat > 25) | (val > 40)).astype(np.uint8) * 255
+    # sat > 30: 대부분 채색 물체 (빨강/노랑/민트/곤색)
+    # 곤색은 어두워서 val이 낮고 sat은 중간 → sat > 25 & val < 120 으로 허용
+    rgb_fg = ((sat > 30) | ((sat > 15) & (val < 120) & (val > 20))).astype(np.uint8) * 255
     mask = cv2.bitwise_and(mask, rgb_fg)
 
     k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -280,7 +303,7 @@ def build_observed_mask(cam: CameraFrame, plane_n, plane_d):
     out = np.zeros_like(mask)
     for i in range(1, num):
         area = stats[i, cv2.CC_STAT_AREA]
-        if area >= 150:
+        if area >= 200:
             out[labels == i] = 255
     return out
 
@@ -507,17 +530,21 @@ def rotation_candidates(src_pts, tgt_pts):
 
 
 def register_model(model_pts, obj_pts, frames, observed_masks):
-    """CAD → 관측 점군 정합. 스케일 ±20% 탐색."""
+    """CAD → 관측 점군 정합. 실물 크기(scale≈1.0) 중심 탐색.
+
+    GLB 모델이 실물 크기(m)이므로 scale=1.0이 정답.
+    뎁스 카메라의 부분 관측을 고려해 ±20% 범위 탐색.
+    """
     obj_center = obj_pts.mean(0)
     obj_max = (obj_pts.max(0)-obj_pts.min(0)).max()
     mod_max = (model_pts.max(0)-model_pts.min(0)).max()
-    base_s = obj_max / mod_max if mod_max > 1e-6 else 1.0
 
     tgt = o3d.geometry.PointCloud(); tgt.points = o3d.utility.Vector3dVector(obj_pts)
     best = None
 
-    for sf in [0.8, 0.9, 1.0, 1.1, 1.2]:
-        scale = base_s * sf
+    # scale=1.0 중심 탐색 (GLB = 실물 크기이므로)
+    for sf in [0.80, 0.88, 0.94, 1.0, 1.06, 1.12, 1.20]:
+        scale = sf                    # 실물 크기 기준 직접 탐색
         scaled = model_pts * scale
         src_c = scaled.mean(0)
         rs = mod_max * scale
@@ -804,8 +831,10 @@ def run_pipeline(data_dir, intrinsics_dir, frame_id,
 
     # 3. 테이블 추정 + 실제 관측 마스크 생성 + mask 기반 점군 융합
     print("\n[1] 테이블 추정 + observed mask 생성")
-    plane_n, plane_d = estimate_table_plane(frames)
-    observed_masks = [build_observed_mask(cam, plane_n, plane_d) for cam in frames]
+    plane_n, plane_d, table_center, table_radius = estimate_table_plane(frames)
+    print(f"  table center: [{table_center[0]:.3f}, {table_center[1]:.3f}, {table_center[2]:.3f}] m")
+    print(f"  table radius: {table_radius:.3f} m")
+    observed_masks = [build_observed_mask(cam, plane_n, plane_d, table_center, table_radius) for cam in frames]
     save_observed_masks(observed_masks, frames, frame_id, out)
 
     above_pts = fuse_masked_points(frames, observed_masks)
@@ -833,6 +862,10 @@ def run_pipeline(data_dir, intrinsics_dir, frame_id,
               f"extent=[{ext[0]*100:.1f},{ext[1]*100:.1f},{ext[2]*100:.1f}]cm")
 
     # 5~7. 각 클러스터별 GLB 매칭 + 정합
+    MIN_CONFIDENCE = 0.03     # 이 미만이면 거부
+    MIN_FITNESS    = 0.10     # ICP fitness 최소 하한
+    MAX_SCALE_DEV  = 0.25     # |scale - 1.0| 허용 편차
+
     all_results = []
     all_poses = []
     all_model_objs = []
@@ -840,49 +873,23 @@ def run_pipeline(data_dir, intrinsics_dir, frame_id,
 
     used_glbs = set()
 
-    for ci, (cpts, cent) in enumerate(clusters):
-        print(f"\n[3-{ci}] 클러스터 #{ci} 처리 ({len(cpts)} pts)")
+    if multi_object:
+        # ── 글로벌 최적 할당: 모든 (클러스터, GLB) 조합 점수 계산 ──
+        print("\n[3] 글로벌 최적 할당 시작")
+        n_glb = len(all_models)
+        # 상위 클러스터만 시도 (물체 수 × 2 또는 최대 12개)
+        max_clusters = min(len(clusters), n_glb * 3, 12)
+        score_table = {}  # (ci, model_name) → (score, pose, support_masks)
 
-        support_masks = project_cluster_to_support_masks(cpts, frames)
+        for ci in range(max_clusters):
+            cpts, cent = clusters[ci]
+            print(f"\n[3-{ci}] 클러스터 #{ci} 처리 ({len(cpts)} pts)")
+            support_masks = project_cluster_to_support_masks(cpts, frames)
 
-        # GLB 결정
-        if glb_path:
-            model_name = Path(glb_path).stem
-            if model_name not in all_models:
-                print(f"  [WARN] {model_name} 모델 없음 → 스킵")
-                continue
-            model = all_models[model_name]
-            model_pts = sample_model_points(model)
-            try:
-                pose = register_model(model_pts, cpts, frames, observed_masks)
-            except RuntimeError as e:
-                print(f"  [FAIL] {e}")
-                continue
-        elif not multi_object:
-            model_name = FRAME_TO_GLB.get(int(frame_id))
-            if model_name is None:
-                raise RuntimeError(f"프레임 {frame_id}에 대한 GLB 매핑 없음")
-            print(f"  매핑: {model_name} ({OBJECT_LABELS.get(model_name,'')})")
-            if model_name not in all_models:
-                print(f"  [WARN] {model_name} 모델 없음 → 스킵")
-                continue
-            model = all_models[model_name]
-            model_pts = sample_model_points(model)
-            try:
-                pose = register_model(model_pts, cpts, frames, observed_masks)
-            except RuntimeError as e:
-                print(f"  [FAIL] {e}")
-                continue
-        else:
-            candidate_models = {k: v for k, v in all_models.items() if k not in used_glbs}
-            shortlist = shortlist_glb_candidates(cpts, candidate_models, top_k=3)
+            shortlist = shortlist_glb_candidates(cpts, all_models, top_k=min(n_glb, 3))
             if not shortlist:
                 print("  매칭 가능한 GLB 없음 → 스킵")
                 continue
-
-            best_pose = None
-            best_model_name = None
-            best_score = -1.0
 
             for cand_name, coarse_score in shortlist:
                 model = all_models[cand_name]
@@ -892,40 +899,111 @@ def run_pipeline(data_dir, intrinsics_dir, frame_id,
                 except RuntimeError:
                     continue
 
+                # scale 편차 검사
+                if abs(pose_tmp.scale - 1.0) > MAX_SCALE_DEV:
+                    print(f"    candidate={cand_name} SKIP scale={pose_tmp.scale:.3f} (편차 초과)")
+                    continue
+
                 final_score = 0.2 * coarse_score + 0.8 * pose_tmp.confidence
                 print(
                     f"    candidate={cand_name} coarse={coarse_score:.3f} "
-                    f"pose_conf={pose_tmp.confidence:.3f} final={final_score:.3f}"
+                    f"pose_conf={pose_tmp.confidence:.3f} scale={pose_tmp.scale:.3f} "
+                    f"fitness={pose_tmp.fitness:.3f} final={final_score:.3f}"
                 )
 
-                if final_score > best_score:
-                    best_score = final_score
-                    best_pose = pose_tmp
-                    best_model_name = cand_name
+                prev = score_table.get((ci, cand_name))
+                if prev is None or final_score > prev[0]:
+                    score_table[(ci, cand_name)] = (final_score, pose_tmp, support_masks)
 
-            if best_model_name is None:
-                print("  [FAIL] 모든 GLB 후보 정합 실패")
+        # ── 탐욕적이 아닌 최적 할당 (GLB당 최고 점수 클러스터) ──
+        print("\n[4] 최적 할당")
+        assigned = {}  # model_name → (ci, score, pose, masks)
+        used_clusters = set()
+
+        # 전체 점수 내림차순 정렬
+        candidates = sorted(score_table.items(), key=lambda x: x[1][0], reverse=True)
+
+        for (ci, mname), (score, pose, masks) in candidates:
+            if mname in assigned or ci in used_clusters:
+                continue
+            # 신뢰도 · fitness 하한 검사
+            if pose.confidence < MIN_CONFIDENCE:
+                print(f"  {mname} 거부: confidence={pose.confidence:.4f} < {MIN_CONFIDENCE}")
+                continue
+            if pose.fitness < MIN_FITNESS:
+                print(f"  {mname} 거부: fitness={pose.fitness:.4f} < {MIN_FITNESS}")
+                continue
+            assigned[mname] = (ci, score, pose, masks)
+            used_clusters.add(ci)
+            label = OBJECT_LABELS.get(mname, mname)
+            print(f"  {label} → 클러스터 #{ci} score={score:.3f} "
+                  f"conf={pose.confidence:.3f} scale={pose.scale:.3f}")
+
+        # 할당된 결과 처리
+        for model_name, (ci, score, pose, support_masks) in sorted(assigned.items()):
+            model = all_models[model_name]
+            used_glbs.add(model_name)
+
+            label = OBJECT_LABELS.get(model_name, model_name)
+            print(f"\n  ── {label} (클러스터 #{ci}) ──")
+            print(f"  position:   [{pose.position_m[0]:+.4f}, {pose.position_m[1]:+.4f}, {pose.position_m[2]:+.4f}] m")
+            print(f"  quaternion: [{pose.quaternion_xyzw[0]:+.4f}, {pose.quaternion_xyzw[1]:+.4f}, "
+                  f"{pose.quaternion_xyzw[2]:+.4f}, {pose.quaternion_xyzw[3]:+.4f}]")
+            print(f"  scale={pose.scale:.4f}  confidence={pose.confidence:.4f}  fitness={pose.fitness:.4f}")
+
+            result = export_result(pose, model, frame_id, out, glb_paths[model_name])
+            all_results.append(result)
+            all_poses.append(pose)
+            all_model_objs.append(model)
+            all_masks_list.append(support_masks)
+
+        unmatched = set(all_models.keys()) - used_glbs
+        if unmatched:
+            print(f"\n  [WARN] 미매칭 GLB: {', '.join(sorted(unmatched))}")
+
+    else:
+        # ── 단일 / 수동 GLB 모드 (기존 로직) ──
+        for ci, (cpts, cent) in enumerate(clusters):
+            print(f"\n[3-{ci}] 클러스터 #{ci} 처리 ({len(cpts)} pts)")
+
+            support_masks = project_cluster_to_support_masks(cpts, frames)
+
+            if glb_path:
+                model_name = Path(glb_path).stem
+                if model_name not in all_models:
+                    print(f"  [WARN] {model_name} 모델 없음 → 스킵")
+                    continue
+            else:
+                model_name = FRAME_TO_GLB.get(int(frame_id))
+                if model_name is None:
+                    raise RuntimeError(f"프레임 {frame_id}에 대한 GLB 매핑 없음")
+                print(f"  매핑: {model_name} ({OBJECT_LABELS.get(model_name,'')})")
+                if model_name not in all_models:
+                    print(f"  [WARN] {model_name} 모델 없음 → 스킵")
+                    continue
+
+            model = all_models[model_name]
+            model_pts = sample_model_points(model)
+            try:
+                pose = register_model(model_pts, cpts, frames, observed_masks)
+            except RuntimeError as e:
+                print(f"  [FAIL] {e}")
                 continue
 
-            model_name = best_model_name
-            pose = best_pose
-            model = all_models[model_name]
-            print(f"  최종 선택: {model_name} score={best_score:.3f}")
+            used_glbs.add(model_name)
 
-        used_glbs.add(model_name)
+            label = OBJECT_LABELS.get(model_name, model_name)
+            print(f"  ── {label} ──")
+            print(f"  position:   [{pose.position_m[0]:+.4f}, {pose.position_m[1]:+.4f}, {pose.position_m[2]:+.4f}] m")
+            print(f"  quaternion: [{pose.quaternion_xyzw[0]:+.4f}, {pose.quaternion_xyzw[1]:+.4f}, "
+                  f"{pose.quaternion_xyzw[2]:+.4f}, {pose.quaternion_xyzw[3]:+.4f}]")
+            print(f"  scale={pose.scale:.4f}  confidence={pose.confidence:.4f}")
 
-        label = OBJECT_LABELS.get(model_name, model_name)
-        print(f"  ── {label} ──")
-        print(f"  position:   [{pose.position_m[0]:+.4f}, {pose.position_m[1]:+.4f}, {pose.position_m[2]:+.4f}] m")
-        print(f"  quaternion: [{pose.quaternion_xyzw[0]:+.4f}, {pose.quaternion_xyzw[1]:+.4f}, "
-              f"{pose.quaternion_xyzw[2]:+.4f}, {pose.quaternion_xyzw[3]:+.4f}]")
-        print(f"  scale={pose.scale:.4f}  confidence={pose.confidence:.4f}")
-
-        result = export_result(pose, model, frame_id, out, glb_paths[model_name])
-        all_results.append(result)
-        all_poses.append(pose)
-        all_model_objs.append(model)
-        all_masks_list.append(support_masks)
+            result = export_result(pose, model, frame_id, out, glb_paths[model_name])
+            all_results.append(result)
+            all_poses.append(pose)
+            all_model_objs.append(model)
+            all_masks_list.append(support_masks)
 
     # 8. 합산 오버레이
     if all_poses:
