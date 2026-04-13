@@ -1,0 +1,9 @@
+path: src/training/blocks_yolo/dataset
+train: images/train
+val: images/val
+
+names:
+  0: object_001
+  1: object_002
+  2: object_003
+  3: object_004

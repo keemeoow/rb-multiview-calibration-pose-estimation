@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kill 51838 52036)",
+      "Bash(kill 52323)",
+      "Bash(awk '{print $2, $9, $10}')",
+      "Bash(awk '{print $2, $10, $11}')",
+      "Bash(awk '{print $2, $10}')",
+      "Bash(awk '{print $10}')",
+      "Bash(ls src/output/pose_pipeline/pose_*_000000.json)",
+      "Bash(ls src/output/pose_pipeline/overlay_000000.png src/output/pose_pipeline/detections_cam*_000000.png src/output/pose_pipeline/observed_mask_cam*_000000.png)",
+      "Bash(ls -la src/output/pose_pipeline/*000000*)",
+      "Bash(ls /Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/src/data/*.glb)",
+      "Bash(kill 62512)",
+      "Bash(cp -r /tmp/pose_mint_fix5/* src/output/single_blocks/frame_000000_mint/)",
+      "Bash(cp /tmp/pose_mint_fix5/* src/output/single_blocks/frame_000000_mint/)",
+      "Bash(cp /tmp/pose_singleblocks_auto2_000005/* src/output/single_blocks/frame_000005_navy/)",
+      "Bash(cp /tmp/pose_singleblocks_auto2_000010/* src/output/single_blocks/frame_000010_yellow/)",
+      "Bash(cp /tmp/pose_singleblocks_auto2_000015/* src/output/single_blocks/frame_000015_red/)",
+      "Bash(kill 88588 88589 88590 88591)",
+      "Bash(ls src/data/object_capture_blocks\\\\\\(1\\\\\\)/cam0/rgb_*.jpg)",
+      "Bash(ls src/data/object_capture_blocks\\\\\\(1\\\\\\)/cam0/*.json)",
+      "Bash(ls src/data/object_capture_blocks\\\\\\(1\\\\\\)/cam0/*.labelme*)"
+    ]
+  }
+}

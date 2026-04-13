@@ -9,6 +9,10 @@ venv/
 
 # Large model artifacts
 src/checkpoints/
+src/models/*.pt
+src/training/blocks_yolo/runs/
+src/training/blocks_yolo/dataset/images/
+src/training/blocks_yolo/dataset/unlabeled/
 
 # OS files
 .DS_Store
