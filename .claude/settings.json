@@ -71,7 +71,16 @@
       "Bash(/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -u src/pose_per_object.py --frame_id 000000 --render_refine --mask_iter_loop)",
       "Bash(cp -r src/output/pose_per_object/frame_000000 src/output/pose_per_object/attempts/12_combined)",
       "Bash(/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -u src/pose_per_object.py --frame_id 000000 --render_refine --mask_iter_loop --depth_seg)",
-      "Bash(cp -r src/output/pose_per_object/frame_000000 src/output/pose_per_object/attempts/15_depth_seg)"
+      "Bash(cp -r src/output/pose_per_object/frame_000000 src/output/pose_per_object/attempts/15_depth_seg)",
+      "Bash(/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -u src/pose_per_object.py --frame_id 000000 --render_refine --depth_seg)",
+      "Bash(cp -r src/output/pose_per_object/frame_000000 src/output/pose_per_object/attempts/19_fixed_mask)",
+      "Bash(pkill -9 -f \"pose_per_object\")",
+      "Bash(/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -u src/pose_per_object_v2.py --frame_id 000000 --render_refine)",
+      "Bash(ls src/output/pose_per_object_v2/frame_000000/comparison*)",
+      "Bash(/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -c ' *)",
+      "Bash(/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -u src/pose_per_object_v2.py --frame_id 000000 --render_refine --auto_converge --multi_yaw --pitch_roll_dof)",
+      "Bash(echo \"PID=$!\")",
+      "Bash(echo \"started PID=$!\")"
     ],
     "additionalDirectories": [
       "/tmp"

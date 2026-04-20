@@ -1,0 +1,11 @@
+{
+  "frame_id": "000000",
+  "objects": [
+    "object_001",
+    "object_002",
+    "object_003",
+    "object_004"
+  ],
+  "cameras": 3,
+  "note": "SAM + fallback color mask"
+}

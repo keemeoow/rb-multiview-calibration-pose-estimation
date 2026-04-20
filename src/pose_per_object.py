@@ -520,6 +520,7 @@ def register_direct(
     masks: List[np.ndarray],
     table_n: np.ndarray,
     table_d: float,
+    scale_override: Optional[float] = None,
 ) -> Optional[PoseEstimate]:
     """Vertical-axis constrained pose estimation.
 
@@ -547,27 +548,16 @@ def register_direct(
     )
     if not inits:
         return None
-    # auto-scale 주변 넓은 범위 탐색. 부분관측에서 auto-scale은 40%까지 과/소
-    # 추정될 수 있어 0.55~1.55 범위를 coarse로 스윕.
-    # Cylinder radius prior: yaw-symmetric이면 관측점 horizontal radius로
-    # scale 하한을 강제 (silhouette 최적화가 얇은 모델을 선호하던 편향 교정).
-    cyl_scale_lb = None
-    if symmetry == "yaw" and len(obj_pts) > 30:
-        a_h, b_h = horizontal_axes(target_up)
-        obs_xy = np.stack([obj_pts @ a_h, obj_pts @ b_h], axis=-1)
-        obs_c = obs_xy.mean(0)
-        obs_r = float(np.percentile(np.linalg.norm(obs_xy - obs_c, axis=1), 90))
-        mod_xy = np.stack([model_pts @ a_h, model_pts @ b_h], axis=-1)
-        mod_r = float(np.percentile(np.linalg.norm(mod_xy, axis=1), 90))
-        if mod_r > 1e-6:
-            cyl_scale_lb = float(obs_r / mod_r)
-            print(f"      [cylinder-prior] obs_r={obs_r*100:.2f}cm "
-                  f"mod_r={mod_r*100:.2f}cm scale_lb={cyl_scale_lb:.3f}")
 
-    # 넓은 스윕: 사용자 피드백으로 cylinders=+10~15%, arch=-5%가 필요 확인.
-    scale_factors = [0.75, 0.88, 1.00, 1.15, 1.35]
+    # scale_override가 있으면 모든 init 후보의 auto_scale을 교체
+    if scale_override is not None:
+        inits = [(R, scale_override) for R, _ in inits]
+        print(f"      [scale-override] auto_scale → {scale_override:.3f}")
+
+    cyl_scale_lb = None
+    scale_factors = [0.85, 0.92, 1.00, 1.08, 1.18]
     print(
-        f"      [init] scale_auto={inits[0][1]:.3f} rot_candidates={len(inits)} "
+        f"      [init] scale={inits[0][1]:.3f} rot_candidates={len(inits)} "
         f"scale_sweep={len(scale_factors)}"
     )
 
@@ -1257,26 +1247,83 @@ def depth_refine_with_flips(
     return best
 
 
+def _compute_target_scale_simple(
+    model: CanonicalModel,
+    glb_src_path: Path,
+    frames: List[CameraFrame],
+    object_name: str,
+) -> Optional[float]:
+    """HSV 마스크 bbox의 **실세계 크기**에서 target scale 계산 (pose 불필요).
+
+    각 카메라에서 HSV 마스크의 bbox를 depth 기반으로 실세계 미터로 변환 후,
+    GLB 모델의 unscaled extent와 비교하여 scale 추정.
+    """
+    scene = trimesh.load(str(glb_src_path))
+    mesh = (trimesh.util.concatenate(list(scene.geometry.values()))
+            if isinstance(scene, trimesh.Scene) else scene.copy())
+    verts = np.asarray(mesh.vertices) - model.center
+    mod_ext = verts.max(0) - verts.min(0)  # unscaled model extent (3D)
+    mod_max = float(mod_ext.max())
+
+    targets = []
+    for cam in frames:
+        color_m = best_connected_component(color_mask_for_object(cam.color_bgr, object_name))
+        obs_ys, obs_xs = np.where(color_m > 0)
+        if len(obs_xs) < 100:
+            continue
+        cx, cy = int(obs_xs.mean()), int(obs_ys.mean())
+        depth = cam.depth_u16.astype(float) * cam.intrinsics.depth_scale
+        # bbox 근처 depth 중앙값
+        y1, y2 = max(0, cy - 20), min(cam.intrinsics.height, cy + 20)
+        x1, x2 = max(0, cx - 20), min(cam.intrinsics.width, cx + 20)
+        d_patch = depth[y1:y2, x1:x2]
+        d_valid = d_patch[(d_patch > 0.05) & (d_patch < 1.5)]
+        if len(d_valid) < 10:
+            continue
+        z_m = float(np.median(d_valid))
+        # bbox pixel 크기 → 실세계 미터
+        ow_px = float(obs_xs.max() - obs_xs.min())
+        oh_px = float(obs_ys.max() - obs_ys.min())
+        K = cam.intrinsics.K
+        ow_m = ow_px * z_m / K[0, 0]
+        oh_m = oh_px * z_m / K[1, 1]
+        obs_max_m = max(ow_m, oh_m)
+        if mod_max > 1e-6:
+            s = obs_max_m / mod_max
+            targets.append(float(s))
+    if len(targets) < 1:
+        return None
+    return float(np.median(targets))
+
+
 def _compute_target_scale(
     pose: PoseEstimate,
     model: CanonicalModel,
     glb_src_path: Path,
     frames: List[CameraFrame],
     masks_obs: List[np.ndarray],
+    object_name: Optional[str] = None,
 ) -> Optional[float]:
-    """관측 마스크의 bbox 크기에서 목표 scale을 역산.
+    """HSV 색상 마스크의 bbox 크기에서 목표 scale을 역산.
 
-    각 카메라에서 rendered bbox와 observed bbox의 크기 비율로 필요한
-    scale 보정량을 계산, 중앙값 반환.
+    depth-seg 마스크는 물체 상단만 캡처해 bbox가 작으므로, 색상 마스크
+    (실제 물체 전체 영역)를 기준으로 scale을 계산.
     """
     scene = trimesh.load(str(glb_src_path))
     mesh = (trimesh.util.concatenate(list(scene.geometry.values()))
             if isinstance(scene, trimesh.Scene) else scene.copy())
     cur_scale = pose.scale
     targets = []
-    for ci, (cam, mask) in enumerate(zip(frames, masks_obs)):
-        obs_ys, obs_xs = np.where(mask > 0)
+    for ci, cam in enumerate(frames):
+        # HSV 색상 마스크로 bbox 계산 (depth-seg 대신)
+        if object_name is not None and object_name in COLOR_REF_HSV:
+            color_m = color_mask_for_object(cam.color_bgr, object_name)
+            color_m = best_connected_component(color_m)
+        else:
+            color_m = masks_obs[ci]
+        obs_ys, obs_xs = np.where(color_m > 0)
         if len(obs_xs) < 50:
+            print(f"        [bbox-scale] cam{ci}: color mask too small ({len(obs_xs)}px)")
             continue
         ow = obs_xs.max() - obs_xs.min()
         oh = obs_ys.max() - obs_ys.min()
@@ -1296,7 +1343,9 @@ def _compute_target_scale(
         sw = cur_scale * (ow / rw)
         sh = cur_scale * (oh / rh)
         targets.append((sw + sh) / 2.0)
-    if len(targets) < 2:
+    print(f"        [bbox-scale] targets={[f'{t:.3f}' for t in targets]} "
+          f"n_valid={len(targets)}")
+    if len(targets) < 1:
         return None
     return float(np.median(targets))
 
@@ -1363,7 +1412,7 @@ def render_and_compare_refine(
         else:
             dx, dy, dz, dyaw, dls = params
             dpitch = droll = 0.0
-        scale = s0 * float(np.exp(dls))
+        scale = s0 * float(np.exp(np.clip(dls, np.log(0.90), np.log(1.10))))
         if min_scale is not None and scale < min_scale:
             scale = min_scale
         R_yaw = Rot.from_rotvec(target_up * dyaw).as_matrix()
@@ -1712,13 +1761,31 @@ def estimate_one(
 
     model_pts = sample_model_points(model, n=6000)
     table_n, table_d, _, _ = table_info
+
+    # bbox 기반 target scale 사전 계산 → register_direct에 전달
+    _pre_scale = _compute_target_scale_simple(
+        model, glb_src_path, frames, object_name,
+    )
+    if _pre_scale is not None:
+        print(f"      [pre-bbox-scale] target={_pre_scale:.3f}")
+
     try:
         pose = register_direct(
-            object_name, model, model_pts, obj_pts, frames, masks, table_n, table_d
+            object_name, model, model_pts, obj_pts, frames, masks, table_n, table_d,
+            scale_override=_pre_scale,
         )
     except Exception as exc:
-        print(f"    [FAIL] {object_name}: 정합 실패 ({exc})")
-        return None, debug_tiles
+        print(f"    [WARN] {object_name}: scale_override 정합 실패 ({exc}), fallback")
+        pose = None
+    if pose is None and _pre_scale is not None:
+        print(f"    [FALLBACK] scale_override 없이 재시도")
+        try:
+            pose = register_direct(
+                object_name, model, model_pts, obj_pts, frames, masks, table_n, table_d,
+            )
+        except Exception as exc:
+            print(f"    [FAIL] {object_name}: fallback도 실패 ({exc})")
+            return None, debug_tiles
     if pose is None:
         print(f"    [FAIL] {object_name}: 정합 실패")
         return None, debug_tiles
@@ -1775,6 +1842,7 @@ def estimate_one(
             # bbox 기반 scale 보정: 관측 마스크 bbox 크기에서 목표 scale 계산
         target_scale = _compute_target_scale(
             pose, model, glb_src_path, frames, masks,
+            object_name=object_name,
         )
         if target_scale is not None and abs(target_scale / pose.scale - 1.0) > 0.15:
             print(f"      [bbox-scale] {pose.scale:.3f} → {target_scale:.3f} "

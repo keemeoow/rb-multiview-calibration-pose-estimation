@@ -1,0 +1,5 @@
+{
+  "frame_id": "000000",
+  "baseline": "src/output/sam_masks/merged_20260420_142735_frame_000000",
+  "method": "targeted cross-cam bbox + SAM for 4 problem masks"
+}
