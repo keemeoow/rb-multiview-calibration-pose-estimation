@@ -34,8 +34,10 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from pose_pipeline import load_calibration, load_frame, OBJECT_SYMMETRY
 from pose_per_object_v2 import (
+    COLOR_REF_HSV,
     color_mask_for_object,
     connected_components_sorted,
+    relaxed_color_mask_for_object,
 )
 from mobile_sam import SamPredictor, sam_model_registry
 
@@ -187,6 +189,324 @@ def run_sam(predictor: SamPredictor, bgr: np.ndarray,
     return cv2.morphologyEx(out, cv2.MORPH_CLOSE, k5)
 
 
+def _mask_3d_extent_axes(mask: np.ndarray, cam) -> Optional[np.ndarray]:
+    """mask 픽셀을 base 좌표로 backproject → 3D extent (sorted desc)."""
+    info = mask_3d_info(mask, cam)
+    if info is None:
+        return None
+    return np.sort(info["extent"])[::-1]
+
+
+def _color_homogeneity(mask: np.ndarray, bgr: np.ndarray, ref_h: float) -> float:
+    """mask 내부 hue가 ref_h 와 가까울수록 1, 멀수록 0."""
+    if int((mask > 0).sum()) < 30:
+        return 0.0
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    ys, xs = np.where(mask > 0)
+    h = hsv[ys, xs, 0].astype(np.float32)
+    diff = np.minimum(np.abs(h - ref_h), 180.0 - np.abs(h - ref_h))
+    # 평균 hue 거리 → 0~30 을 1~0 으로 매핑
+    score = float(np.clip(1.0 - np.mean(diff) / 30.0, 0.0, 1.0))
+    return score
+
+
+def _compactness(mask: np.ndarray) -> float:
+    """area / convex_hull_area (1.0 에 가까울수록 단단한 block-like 형태)."""
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return 0.0
+    cnt = max(cnts, key=cv2.contourArea)
+    a = cv2.contourArea(cnt)
+    if a < 30:
+        return 0.0
+    hull = cv2.convexHull(cnt)
+    ah = cv2.contourArea(hull)
+    if ah < 1:
+        return 0.0
+    return float(min(1.0, a / ah))
+
+
+def evaluate_mask_quality(mask: np.ndarray, bgr: np.ndarray, cam,
+                          obj_name: str, glb_ext: np.ndarray,
+                          ref_h: float) -> dict:
+    """마스크 품질 점수 (3D extent + 색상 균질성 + compactness)."""
+    info = mask_3d_info(mask, cam)
+    extent_score = 0.0
+    extent_axes = None
+    over_axis = False
+    under_axis = False
+    if info is not None:
+        ax = np.sort(info["extent"])[::-1]
+        ge = np.sort(glb_ext)[::-1]
+        extent_axes = ax
+        ratios = []
+        for a, g in zip(ax, ge):
+            if g < 1e-6:
+                continue
+            r = a / g
+            ratios.append(min(r, 1.0 / r))
+            if r > 1.6:
+                over_axis = True
+            if r < 0.35:
+                under_axis = True
+        if ratios:
+            extent_score = float(np.mean(ratios))
+    color_score = _color_homogeneity(mask, bgr, ref_h)
+    compact = _compactness(mask)
+    area = int((mask > 0).sum())
+    if area < 80:
+        total = 0.0
+    else:
+        # 가중 평균: 3D extent 50%, 색 30%, compactness 20%
+        total = 0.5 * extent_score + 0.3 * color_score + 0.2 * compact
+    return {
+        "score": total,
+        "extent_score": extent_score,
+        "color_score": color_score,
+        "compactness": compact,
+        "area": area,
+        "extent_axes_m": extent_axes.tolist() if extent_axes is not None else None,
+        "over_axis": over_axis,
+        "under_axis": under_axis,
+    }
+
+
+def _tighten_with_grabcut(mask: np.ndarray, bgr: np.ndarray,
+                          shrink_px: int = 5,
+                          extra_fgd: Optional[np.ndarray] = None) -> np.ndarray:
+    """GrabCut으로 마스크를 image edge에 맞춰 tightening.
+
+    - 마스크 erode → PR_FGD seed
+    - 마스크 ↔ dilated 사이 → PR_BGD seed
+    - dilated 외부 → BGD
+    - extra_fgd: 추가로 강제 FGD로 마킹할 영역 (예: navy 윗면 색상 mask)
+    """
+    if int((mask > 0).sum()) < 100:
+        return mask
+    H, W = mask.shape[:2]
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                   (shrink_px * 2 + 1, shrink_px * 2 + 1))
+    eroded = cv2.erode(mask, k, iterations=1)
+    dilated = cv2.dilate(mask, k, iterations=2)
+    gc_mask = np.full((H, W), cv2.GC_BGD, dtype=np.uint8)
+    gc_mask[dilated > 0] = cv2.GC_PR_BGD
+    gc_mask[mask > 0] = cv2.GC_PR_FGD
+    gc_mask[eroded > 0] = cv2.GC_FGD
+    if extra_fgd is not None:
+        # 강제 FGD: 색상 mask로 표시된 어두운 윗면 등 grabcut 이 놓치는 영역
+        gc_mask[extra_fgd > 0] = cv2.GC_FGD
+    bgd = np.zeros((1, 65), dtype=np.float64)
+    fgd = np.zeros((1, 65), dtype=np.float64)
+    try:
+        cv2.grabCut(bgr, gc_mask, None, bgd, fgd, 3, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return mask
+    out = np.where(
+        (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
+    ).astype(np.uint8)
+    if int((out > 0).sum()) < 100:
+        return mask
+    return _largest_cc(out)
+
+
+def _halo_strip(mask: np.ndarray, erode_px: int = 5,
+                dilate_back_px: int = 3) -> np.ndarray:
+    """가장자리 halo(블록 주변 색상 같은 잡티) + tail 제거.
+
+    erode → 가장 큰 CC → 약간 작은 dilate. 본체는 유지하면서 주변/꼬리
+    픽셀만 떼어냄.
+    """
+    if int((mask > 0).sum()) < 100:
+        return mask
+    ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                    (erode_px * 2 + 1, erode_px * 2 + 1))
+    eroded = cv2.erode(mask, ke, iterations=1)
+    eroded = _largest_cc(eroded)
+    if int((eroded > 0).sum()) < 40:
+        return mask
+    kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                    (dilate_back_px * 2 + 1,
+                                     dilate_back_px * 2 + 1))
+    out = cv2.dilate(eroded, kd, iterations=1)
+    # 원래 mask 영역 안에서만 유지 → 본체 영역에서 tail/halo만 제거
+    out = cv2.bitwise_and(out, mask)
+    out = _largest_cc(out)
+    return out
+
+
+def _open_largest(mask: np.ndarray, k_size: int = 5) -> np.ndarray:
+    """morph_open + 가장 큰 CC: 작은 fragments/tail 일괄 제거."""
+    if int((mask > 0).sum()) < 80:
+        return mask
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    op = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    op = _largest_cc(op)
+    if int((op > 0).sum()) < 80:
+        return mask
+    return op
+
+
+def _fill_holes(mask: np.ndarray) -> np.ndarray:
+    """floodfill 기반 닫힌 hole 채움."""
+    if int((mask > 0).sum()) < 80:
+        return mask
+    h, w = mask.shape
+    ff = mask.copy()
+    mk = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(ff, mk, (0, 0), 255)
+    holes = cv2.bitwise_not(ff)
+    return cv2.bitwise_or(mask, holes)
+
+
+def _convex_hull_fill(mask: np.ndarray) -> np.ndarray:
+    """가장 큰 contour의 convex hull로 마스크 채움 (열린 U자형, 분산형 해결)."""
+    if int((mask > 0).sum()) < 80:
+        return mask
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return mask
+    cnt = max(cnts, key=cv2.contourArea)
+    hull = cv2.convexHull(cnt)
+    out = np.zeros_like(mask)
+    cv2.drawContours(out, [hull], -1, 255, thickness=cv2.FILLED)
+    return out
+
+
+def auto_refine_mask(initial: np.ndarray, bgr: np.ndarray, cam, obj_name: str,
+                     glb_ext: np.ndarray, ref_h: float,
+                     max_iter: int = 10,
+                     verbose: bool = True) -> tuple:
+    """반복 정제: 3D extent + 색 + compactness 점수가 plateau 될 때까지.
+
+    행동 풀 (현재 점수와 약점에 따라 그때그때 선택):
+      - close+largest : 분리된 fragments 합치기 (다중 component)
+      - halo_strip    : block 주변 halo 제거 (compactness 낮은 단일 CC)
+      - grabcut       : image edge 에 snap (color_score 낮음 또는 미세 over)
+      - erode         : extent over (3D 너무 큼)
+      - dilate        : extent under (3D 너무 작음)
+
+    각 후보 액션의 결과 점수를 비교, 가장 좋은 것을 채택.
+    """
+    cur = initial.copy()
+    best = initial.copy()
+    best_q = evaluate_mask_quality(best, bgr, cam, obj_name, glb_ext, ref_h)
+    initial_area = best_q["area"]
+    # 초기 영역의 60% 미만으로는 어떤 경우에도 줄이지 않음 (점수 fooling 방지)
+    abs_min_area = max(150, int(initial_area * 0.6))
+    if verbose:
+        print(f"      [auto] iter0 score={best_q['score']:.3f} "
+              f"ext={best_q['extent_score']:.2f} col={best_q['color_score']:.2f} "
+              f"cmp={best_q['compactness']:.2f} area={best_q['area']} "
+              f"(min_floor={abs_min_area})")
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    no_improve = 0
+    used_grabcut = 0
+    used_halo = 0
+
+    for it in range(1, max_iter + 1):
+        q = evaluate_mask_quality(cur, bgr, cam, obj_name, glb_ext, ref_h)
+        if q["score"] >= 0.88:
+            break
+        # 후보 액션들 모두 시도 → 점수가 올라간 것 중 최고 채택
+        candidates = []
+        # multi-component → close
+        n, _, _, _ = cv2.connectedComponentsWithStats(cur, connectivity=8)
+        if n - 1 >= 2:
+            c = cv2.morphologyEx(cur, cv2.MORPH_CLOSE, k7)
+            c = _largest_cc(c)
+            candidates.append(("close+largest", c))
+        # 속 빈 형태 (compactness 매우 낮음) → 구멍 채움 + convex hull fill
+        if q["compactness"] < 0.6:
+            candidates.append(("fill_holes", _fill_holes(cur)))
+            candidates.append(("hull_fill", _convex_hull_fill(cur)))
+        # 단일 CC지만 compactness 낮음 → halo strip + open_largest 후보
+        if q["compactness"] < 0.85 and used_halo < 3:
+            candidates.append(("halo_strip4",
+                                _halo_strip(cur, erode_px=4, dilate_back_px=3)))
+            candidates.append(("halo_strip6",
+                                _halo_strip(cur, erode_px=6, dilate_back_px=4)))
+            candidates.append(("open5", _open_largest(cur, k_size=5)))
+            candidates.append(("open7", _open_largest(cur, k_size=7)))
+        # color/edge alignment 약함 → grabcut
+        if (q["color_score"] < 0.9 or q["compactness"] < 0.9) and used_grabcut < 2:
+            extra_fgd = None
+            if obj_name == "object_003":
+                # navy 윗면이 어두워 grabcut 이 BG로 분류하지 않게 강제 FGD seed
+                ys, xs = np.where(cur > 0)
+                if len(xs) > 0:
+                    bb = (int(xs.min()), int(ys.min()),
+                          int(xs.max()), int(ys.max()))
+                    extra_fgd = _navy_top_face_mask(bgr, bb)
+            c = _tighten_with_grabcut(cur, bgr, shrink_px=4,
+                                      extra_fgd=extra_fgd)
+            candidates.append(("grabcut", c))
+        # extent over
+        if q["over_axis"]:
+            c = cv2.erode(cur, k3, iterations=1)
+            c = _largest_cc(c)
+            candidates.append(("erode", c))
+        # extent under
+        if q["under_axis"] and it <= 2:
+            c = cv2.dilate(cur, k3, iterations=1)
+            candidates.append(("dilate", c))
+
+        # area 가드: 절대 하한 (initial × 0.6) 와 현재 비율 floor 중 큰 값.
+        # compactness 가 매우 낮으면(<0.4) 비율 floor 만 살짝 낮춤.
+        if q["compactness"] < 0.4:
+            ratio = 0.5
+        elif q["compactness"] < 0.6:
+            ratio = 0.6
+        else:
+            ratio = 0.7
+        min_area_keep = max(abs_min_area, int(q["area"] * ratio))
+        best_action = None; best_action_q = None; best_action_mask = None
+        for name, m in candidates:
+            a = int((m > 0).sum())
+            if a < min_area_keep:
+                continue
+            qm = evaluate_mask_quality(m, bgr, cam, obj_name, glb_ext, ref_h)
+            if best_action_q is None or qm["score"] > best_action_q["score"]:
+                best_action_q = qm; best_action = name; best_action_mask = m
+        if best_action is None:
+            break
+        if verbose:
+            print(f"      [auto] iter{it} action={best_action} → "
+                  f"score={best_action_q['score']:.3f} "
+                  f"ext={best_action_q['extent_score']:.2f} "
+                  f"col={best_action_q['color_score']:.2f} "
+                  f"cmp={best_action_q['compactness']:.2f} "
+                  f"area={best_action_q['area']}")
+        if "halo" in best_action:
+            used_halo += 1
+        if best_action == "grabcut":
+            used_grabcut += 1
+        if best_action_q["score"] > best_q["score"] + 1e-3:
+            best = best_action_mask.copy()
+            best_q = best_action_q
+            cur = best_action_mask
+            no_improve = 0
+        else:
+            no_improve += 1
+            cur = best_action_mask
+        if no_improve >= 2:
+            break
+
+    if verbose:
+        print(f"      [auto] best score={best_q['score']:.3f} "
+              f"area={best_q['area']}")
+    return best, best_q
+
+
+def _largest_cc(mask: np.ndarray) -> np.ndarray:
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n <= 1:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    best = 1 + int(np.argmax(areas))
+    return np.where(labels == best, 255, 0).astype(np.uint8)
+
+
 def keep_nearest_component(mask: np.ndarray, bbox: tuple) -> np.ndarray:
     """bbox 중심에 가장 가까운 component만 유지."""
     n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -204,6 +524,104 @@ def keep_nearest_component(mask: np.ndarray, bbox: tuple) -> np.ndarray:
     if best_i < 0:
         return mask
     return np.where(labels == best_i, 255, 0).astype(np.uint8)
+
+
+def _navy_top_face_mask(bgr: np.ndarray, bbox: tuple) -> np.ndarray:
+    """곤색 블록의 어두운 윗면(저채도/저명도 청회색)을 bbox 내부에서만 추출.
+
+    중요: hue 범위를 mint(~90)와 분리하기 위해 hue 100~130 으로 제한,
+    v_max 도 75로 강화 (mint v_min=110 보다 한참 아래).
+    """
+    H, W = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h = hsv[:, :, 0].astype(np.float32)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    hue_ok = (h >= 100) & (h <= 130)
+    sv_ok = (s >= 20) & (v >= 10) & (v <= 75)
+    m = (hue_ok & sv_ok).astype(np.uint8) * 255
+    x1, y1, x2, y2 = bbox
+    pad = 4
+    x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
+    x2 = min(W, x2 + pad); y2 = min(H, y2 + pad)
+    out = np.zeros_like(m)
+    out[y1:y2, x1:x2] = m[y1:y2, x1:x2]
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    out = cv2.morphologyEx(out, cv2.MORPH_OPEN, k3)
+    return out
+
+
+def filter_by_color(mask: np.ndarray, bgr: np.ndarray, obj_name: str,
+                    bbox: tuple,
+                    hue_radius: float = 25.0,
+                    tighten: bool = False) -> np.ndarray:
+    """SAM 결과에서 색상이 안 맞는 픽셀을 제거.
+
+    - bbox 내부 relaxed color mask와 AND → 인접 다른 색 노이즈 컷
+    - tighten=True 면 작은 open(3x3) 으로 경계 잡음 제거 (실린더용, erode 는 안함)
+    - 곤색(object_003)은 윗면(저명도 100~130 hue)만 추가로 합집합
+    - 결과는 SAM 마스크의 dilated 영역을 절대 넘지 않도록 cap (인접 다른 물체 차단)
+    """
+    if mask.max() == 0:
+        return mask
+    H, W = mask.shape[:2]
+    color_m = relaxed_color_mask_for_object(bgr, obj_name, hue_radius=hue_radius)
+    x1, y1, x2, y2 = bbox
+    pad = 4
+    x1p = max(0, x1 - pad); y1p = max(0, y1 - pad)
+    x2p = min(W, x2 + pad); y2p = min(H, y2 + pad)
+    color_in_bbox = np.zeros_like(color_m)
+    color_in_bbox[y1p:y2p, x1p:x2p] = color_m[y1p:y2p, x1p:x2p]
+    if obj_name == "object_003":
+        # mint hue 와 분리되는 어두운 청회색만 추가
+        top = _navy_top_face_mask(bgr, bbox)
+        color_in_bbox = cv2.bitwise_or(color_in_bbox, top)
+    if int((color_in_bbox > 0).sum()) < 50:
+        return mask
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    color_dil = cv2.dilate(color_in_bbox, k5, iterations=2)
+    inter = cv2.bitwise_and(mask, color_dil)
+    if int((inter > 0).sum()) < 50:
+        # SAM이 색상 픽셀을 거의 담지 못함 → bbox 내 color mask를 사용,
+        # 단 SAM 마스크의 dilated 영역으로만 제한하여 인접 다른 물체로 새지 않게.
+        sam_dil = cv2.dilate(mask, k5, iterations=2)
+        out = cv2.bitwise_and(color_in_bbox, sam_dil)
+    else:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(inter, connectivity=8)
+        if n <= 1:
+            out = inter
+        else:
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            best = 1 + int(np.argmax(areas))
+            out = np.where(labels == best, 255, 0).astype(np.uint8)
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    if tighten:
+        out = cv2.morphologyEx(out, cv2.MORPH_OPEN, k3)
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, k3)
+    if obj_name == "object_003":
+        # SAM 마스크 + dilation 으로 cap → 윗면 색상만 사용해 외부로 새는 거 차단.
+        sam_dil = cv2.dilate(mask, k5, iterations=3)
+        union_src = cv2.bitwise_or(out, color_in_bbox)
+        union_src = cv2.bitwise_and(union_src, sam_dil)
+        k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        union = cv2.morphologyEx(union_src, cv2.MORPH_CLOSE, k7)
+        n2, lab2, st2, _ = cv2.connectedComponentsWithStats(union, connectivity=8)
+        if n2 > 1:
+            cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
+            best_i, best_d = -1, 1e9
+            for i in range(1, n2):
+                if st2[i, cv2.CC_STAT_AREA] < 200:
+                    continue
+                cxi = st2[i, cv2.CC_STAT_LEFT] + st2[i, cv2.CC_STAT_WIDTH] / 2
+                cyi = st2[i, cv2.CC_STAT_TOP] + st2[i, cv2.CC_STAT_HEIGHT] / 2
+                d = (cxi - cx) ** 2 + (cyi - cy) ** 2
+                if d < best_d:
+                    best_d = d; best_i = i
+            if best_i >= 0:
+                out = np.where(lab2 == best_i, 255, 0).astype(np.uint8)
+        else:
+            out = union
+    return out
 
 
 # ═══════════════════════════════════════════════════════════
@@ -265,12 +683,31 @@ def process_object(obj_name: str, frames, glb_path: Path,
         if use_own:
             mask, info, score = entry
             ys, xs = np.where(mask > 0)
-            bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+            own_bb = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+            # own bbox ∪ anchor 3D centroid + GLB extent projection.
+            # 색상 mask가 어두운 윗면이나 음영을 빠뜨려 잘렸을 때 보강.
+            proj_bb = project_bbox_from_3d(
+                centroid_anchor, glb_ext, cam, padding_m=0.012
+            )
+            if proj_bb is not None:
+                bbox = (
+                    min(own_bb[0], proj_bb[0]),
+                    min(own_bb[1], proj_bb[1]),
+                    max(own_bb[2], proj_bb[2]),
+                    max(own_bb[3], proj_bb[3]),
+                )
+            else:
+                bbox = own_bb
             source = "own"
         else:
-            ext_for_proj = glb_ext * 0.7
+            # cross-cam projection: anchor가 본 실제 3D extent로 projection
+            # (anchor의 mask_3d_info → 픽셀-깊이 기반 percentile extent).
+            # GLB 전체 사용시 over-extension, 0.7× 사용시 navy 같은 긴 형상 잘림.
+            anchor_ext = anchor_entry[1]["extent"]
+            ext_for_proj = np.maximum(anchor_ext, glb_ext * 0.45)
+            ext_for_proj = np.minimum(ext_for_proj, glb_ext * 1.05)
             bbox = project_bbox_from_3d(
-                centroid_anchor, ext_for_proj, cam, padding_m=0.015
+                centroid_anchor, ext_for_proj, cam, padding_m=0.012
             )
             if bbox is None:
                 final_masks.append(np.zeros(cam.color_bgr.shape[:2], dtype=np.uint8))
@@ -278,14 +715,8 @@ def process_object(obj_name: str, frames, glb_path: Path,
                 continue
             source = "cross-cam"
 
-        # 특수 제약: navy block은 수평형이므로 bbox 높이를 50%로 제한
-        if constraints.get("horizontal_constrain"):
-            x1, y1, x2, y2 = bbox
-            h = y2 - y1; cy_b = (y1 + y2) // 2
-            new_h = int(h * 0.5)
-            y1 = max(0, cy_b - new_h // 2)
-            y2 = min(cam.intrinsics.height - 1, cy_b + new_h // 2)
-            bbox = (x1, y1, x2, y2)
+        # navy 블록 horizontal_constrain은 own_bb + projected_bb union에서는 비활성.
+        # (윗면 어두운 부분이 잘렸던 원인이라 그대로 두고 SAM이 판단).
 
         # SAM prompt 구성
         cx = (bbox[0] + bbox[2]) // 2
@@ -299,8 +730,32 @@ def process_object(obj_name: str, frames, glb_path: Path,
         with torch.no_grad():
             m = run_sam(predictor, cam.color_bgr, bbox, points)
         m = keep_nearest_component(m, bbox)
+        area_raw = int((m > 0).sum())
+        tighten = is_cyl
+        m = filter_by_color(m, cam.color_bgr, obj_name, bbox, tighten=tighten)
+        area_cf = int((m > 0).sum())
+        # auto-refine: 3D extent + 색 + compactness 점수가 plateau 될 때까지
+        ref_h = COLOR_REF_HSV.get(obj_name, (0.0,))[0]
+        m, q = auto_refine_mask(m, cam.color_bgr, cam, obj_name, glb_ext, ref_h)
+        # navy: auto-refine 이 윗면 어두운 부분을 잘라내는 경향 → 마무리에 강제 union
+        if obj_name == "object_003":
+            ys, xs = np.where(m > 0)
+            if len(xs) > 0:
+                bb_now = (int(xs.min()), int(ys.min()),
+                          int(xs.max()), int(ys.max()))
+                top = _navy_top_face_mask(cam.color_bgr, bb_now)
+                # 마스크 dilation 영역 안의 top 만 OR (외부로 새지 않게)
+                kk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                m_dil = cv2.dilate(m, kk, iterations=1)
+                top = cv2.bitwise_and(top, m_dil)
+                m = cv2.bitwise_or(m, top)
+                kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kc)
+                m = _largest_cc(m)
         area = int((m > 0).sum())
-        print(f"    cam{ci}: {source} bbox={bbox} → SAM area={area}")
+        print(f"    cam{ci}: {source} bbox={bbox} → "
+              f"SAM={area_raw} → color={area_cf} → auto={area} "
+              f"(score={q['score']:.2f})")
         final_masks.append(m)
 
     return final_masks

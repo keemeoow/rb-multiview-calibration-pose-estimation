@@ -1,0 +1,10 @@
+{
+  "frame_id": "000001",
+  "method": "unified: HSV + 3D size filter + cross-cam projection + SAM",
+  "reliability_threshold": 0.35,
+  "constraints": {
+    "object_003": {
+      "horizontal_constrain": true
+    }
+  }
+}
