@@ -1,0 +1,49 @@
+{
+  "name": "object_003",
+  "label": "곤색 직사각형",
+  "glb": "src/data/object_003.glb",
+  "overlay_color_bgr": [
+    255,
+    140,
+    40
+  ],
+  "color_prior": {
+    "enabled": true,
+    "hue_ref": 103.0,
+    "hue_radius": 18.0,
+    "s_min": 55,
+    "v_min": 20,
+    "v_max": 120,
+    "relaxed_hue_radius": 22.0,
+    "relaxed_v_max": 255
+  },
+  "multicolor": false,
+  "sam": {
+    "bbox_pad_ratio": 0.05,
+    "prompt_strategy": "centroid",
+    "post_color_intersect": true,
+    "auto_refine": "full",
+    "reliability_threshold": 0.3
+  },
+  "shape": {
+    "symmetry": "none",
+    "init_orientation": "auto",
+    "yaw_steps": 24,
+    "anisotropic_scale": true,
+    "horizontal_constrain": true
+  },
+  "pose": {
+    "method": "render_compare",
+    "icp_voxel": 0.005,
+    "icp_max_iter": 80,
+    "render_topk": 3,
+    "render_max_iter": 120,
+    "render_simplify_faces": 2000,
+    "render_orientation_grid": 24,
+    "render_cam_weights": [
+      1.0,
+      1.0,
+      2.0
+    ]
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "name": "peg",
+  "label": "검정 실린더",
+  "glb": "src/data_peginhole/Peg.glb",
+  "overlay_color_bgr": [
+    100,
+    220,
+    100
+  ],
+  "color_prior": {
+    "enabled": true,
+    "hue_ref": 0.0,
+    "hue_radius": 180.0,
+    "s_min": 0,
+    "v_min": 0,
+    "v_max": 50,
+    "relaxed_hue_radius": 180.0,
+    "relaxed_s_min": 0,
+    "relaxed_v_min": 0,
+    "relaxed_v_max": 90,
+    "background_white_assist": true,
+    "white_v_min": 150,
+    "white_dilate_px": 25
+  },
+  "multicolor": false,
+  "sam": {
+    "bbox_pad_ratio": 0.05,
+    "prompt_strategy": "cylinder_axis",
+    "post_color_intersect": true,
+    "auto_refine": "full",
+    "reliability_threshold": 0.05,
+    "own_bbox_max_image_ratio": 0.4,
+    "scale_range_min": 0.03,
+    "scale_range_max": 0.15,
+    "bbox_combine": "union"
+  },
+  "shape": {
+    "symmetry": "yaw",
+    "init_orientation": "upright",
+    "yaw_steps": 1,
+    "anisotropic_scale": false,
+    "horizontal_constrain": false
+  },
+  "pose": {
+    "method": "render_compare",
+    "icp_voxel": 0.005,
+    "icp_max_iter": 80,
+    "render_topk": 2,
+    "render_max_iter": 100,
+    "render_simplify_faces": 1500,
+    "render_orientation_grid": 1,
+    "render_cam_weights": [
+      1.0,
+      1.0,
+      1.5
+    ],
+    "refine_tilt_dof": true,
+    "table_plane_use_white_assist": true
+  }
+}

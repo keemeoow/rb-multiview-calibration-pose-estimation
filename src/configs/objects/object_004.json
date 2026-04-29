@@ -1,0 +1,49 @@
+{
+  "name": "object_004",
+  "label": "민트 실린더",
+  "glb": "src/data/object_004.glb",
+  "overlay_color_bgr": [
+    210,
+    240,
+    130
+  ],
+  "color_prior": {
+    "enabled": true,
+    "hue_ref": 90.0,
+    "hue_radius": 16.0,
+    "s_min": 50,
+    "v_min": 110,
+    "v_max": 240,
+    "relaxed_hue_radius": 22.0
+  },
+  "multicolor": false,
+  "sam": {
+    "bbox_pad_ratio": 0.05,
+    "prompt_strategy": "cylinder_axis",
+    "post_color_intersect": true,
+    "auto_refine": "full",
+    "reliability_threshold": 0.3,
+    "own_bbox_max_image_ratio": 0.5
+  },
+  "shape": {
+    "symmetry": "yaw",
+    "init_orientation": "auto",
+    "yaw_steps": 1,
+    "anisotropic_scale": false,
+    "horizontal_constrain": false
+  },
+  "pose": {
+    "method": "render_compare",
+    "icp_voxel": 0.005,
+    "icp_max_iter": 80,
+    "render_topk": 3,
+    "render_max_iter": 120,
+    "render_simplify_faces": 2000,
+    "render_orientation_grid": 1,
+    "render_cam_weights": [
+      1.0,
+      1.0,
+      2.0
+    ]
+  }
+}

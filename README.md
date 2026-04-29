@@ -1,263 +1,306 @@
-# Object Capture → SMA3D → Pose Estimation Pipeline (src)
+# Multi-view RGB-D 6D Pose Estimation Pipeline
 
-이 문서는 아래 4개 스크립트를 기준으로 파이프라인을 정리합니다.
+3대 RealSense RGB-D 카메라로 촬영한 멀티뷰 이미지에서, GLB 레퍼런스 모델을 가지는
+임의 물체의 **6DoF 포즈 + 스케일**을 추정합니다.
 
-- `Obj_Step1_capture_rgbd_3cam.py`
-- `Obj_Step2_multiview_pose_estimation.py`
-- `Obj_Step3_visualize_pose_result.py`
-- `Obj_Step22_Pose_Estimation_pipeline_result.py`
+핵심은 **profile JSON 한 파일**로 한 물체의 SAM 마스크 + 포즈 추정 동작을 모두
+정의하는 것이며, 어떤 물체든 profile을 추가하면 동일한 코드가 적용됩니다.
 
 ---
 
-## 0. 전체 파이프라인
+## 0. 전체 흐름
 
-1. 물체 RGB-D 촬영 (3대 RealSense)
-2. SMA3D 웹사이트에서 물체 3D 모델 추출 (`.glb` 또는 `.ply`)
-3. 멀티뷰 포즈 추정 (cam0 기준 6DoF)
-4. 결과 시각화/디버그 시각화
+```
+[1] 멀티뷰 RGB-D 촬영        →   src/data*/object_capture/cam{0,1,2}/
+       Obj_Step1_capture_rgbd_3cam.py
 
-권장 데이터 흐름:
+[2] 레퍼런스 3D 모델 추출      →   src/data*/<obj>.glb     (외부, SMA3D 등)
+       (수동)
 
-```text
-src3/data/object_capture/cam{0,1,2}/rgb_*.jpg, depth_*.png
-  + src3/data/_intrinsics/cam{0,1,2}.npz
-  + src3/data/cube_session_01/calib_out_cube/T_C0_C1.npy, T_C0_C2.npy
-  + src3/data/reference_knife.glb (or reference_knife.ply)
+[3] 물체 profile JSON 작성    →   src/configs/objects/<obj>.json
+
+[4] 파이프라인 실행            →   src/output/pipeline_<ts>_frame_<id>/
+       run_pipeline.py
+       (SAM mask → ICP/render-compare pose → posed GLB + viz)
 ```
 
 ---
 
-## 1) `Obj_Step1_capture_rgbd_3cam.py`
+## 1. 디렉토리 구조
 
-### 1-1. 코드 설명
-
-- 3대 RealSense를 동시에 열고 RGB+Depth를 획득합니다.
-- `device_map.json`이 있으면 카메라 인덱스(`cam0/1/2`)를 고정 매핑합니다.
-- 미리보기 창에서 키 입력으로 저장을 제어합니다.
-  - `SPACE`: 현재 프레임 1회 저장
-  - `s`: 연속 저장 모드 ON/OFF
-  - `ESC` 또는 `q`: 종료
-- 저장 형식:
-  - `camX/rgb_000000.jpg`
-  - `camX/depth_000000.png`
-
-### 1-2. 실행 명령어 (모드 포함)
-
-`src3` 기준:
-
-```bash
-python Obj_Step1_capture_rgbd_3cam.py --save_dir ./data/object_capture
+```
+src/
+├── pipeline_core.py            # 모든 SAM + pose 로직 (라이브러리)
+├── run_pipeline.py             # CLI 진입점 (메인)
+├── run_knife_pipeline.py       # legacy thin wrapper (호환용)
+├── pose_pipeline.py            # 기초 유틸 (load_calibration / load_frame /
+│                                  normalize_glb / estimate_table_plane)
+├── Obj_Step1_capture_rgbd_3cam.py  # 데이터 캡처
+├── configs/objects/
+│   ├── README.md                  # profile 옵션 상세 + 사용 예시
+│   ├── object_001.json            # 빨강 아치
+│   ├── object_002.json            # 노랑 실린더
+│   ├── object_003.json            # 곤색 직사각형 (anisotropic + horizontal_constrain)
+│   ├── object_004.json            # 민트 실린더
+│   └── knife.json                 # 노란 박스커터 (multicolor + lying_flat)
+└── weights/
+    └── mobile_sam.pt              # MobileSAM ViT-T 가중치
 ```
 
-해상도/FPS/인트린식 경로 지정:
+데이터:
+```
+src/data/                          # 4-블록 데이터셋
+├── object_capture/cam{0,1,2}/rgb_*.jpg, depth_*.png
+├── intrinsics/cam{0,1,2}.npz
+├── cube_session_01/calib_out_cube/T_C0_C{1,2}.npy
+└── object_001.glb ... object_004.glb
+
+src/data_knife/                    # knife 데이터셋
+├── object_capture/cam{0,1,2}/rgb_*.jpg, depth_*.png
+├── _intrinsics/cam{0,1,2}.npz
+├── cube_session_01/calib_out_cube/T_C0_C{1,2}.npy
+└── reference_knife.glb
+```
+
+---
+
+## 2. Step 1 — RGB-D 캡처
+
+### 코드
+- 3대 RealSense를 동시에 열고 RGB+Depth 획득
+- `device_map.json`이 있으면 `cam0/1/2` 인덱스 고정 매핑
+- 키 입력으로 저장 제어:
+  - `SPACE`: 1프레임 저장
+  - `s`: 연속 저장 ON/OFF
+  - `ESC` / `q`: 종료
+
+### 실행
 
 ```bash
-python Obj_Step1_capture_rgbd_3cam.py \
+python src/Obj_Step1_capture_rgbd_3cam.py --save_dir ./data/object_capture
+# 해상도/FPS/intrinsic 경로 지정
+python src/Obj_Step1_capture_rgbd_3cam.py \
   --save_dir ./data/object_capture \
   --intrinsics_dir ./data/_intrinsics \
   --fps 15 --width 640 --height 480
 ```
 
-모드:
-
-- 단발 저장 모드: `SPACE`로만 저장
-- 연속 저장 모드: `s`를 눌러 토글
-
-### 1-3. 결과값
-
-- `--save_dir` 하위에 `cam0`, `cam1`, `cam2` 폴더 생성
-- 각 폴더에 프레임 번호 기준 RGB/Depth 쌍 저장
-- 종료 시 총 저장 프레임 수 출력
+### 결과
+- `<save_dir>/cam{0,1,2}/rgb_NNNNNN.jpg`
+- `<save_dir>/cam{0,1,2}/depth_NNNNNN.png`
 
 ---
 
-## 2) SMA3D 웹사이트 단계 (외부에서 직접하기)
+## 3. Step 2 — 레퍼런스 3D 모델 (외부)
 
-### 2-1. 코드 연결 설명
-
-- 이 단계는 별도 Python 스크립트가 아니라 외부 웹(SMA3D)에서 3D를 추출하는 단계입니다.
-- 추출한 모델을 Step2가 읽을 수 있는 경로에 배치합니다.
-
-권장 파일명/위치:
-
-- `src3/data/reference_knife.glb` (기본)
-- 또는 `src3/data/reference_knife.ply` (있으면 Step2에서 우선 사용)
-
-### 2-2. 실행 명령어
-
-- 웹 업로드/추출 단계라 CLI 명령어는 없습니다.
-
-### 2-3. 결과값
-
-- 물체 레퍼런스 3D 모델 (`.glb` 또는 `.ply`)
-- 이후 Step2에서 정합 대상(Reference Model)로 사용
+SMA3D 등 외부 도구로 GLB/PLY 추출 후 `src/data*/<obj>.glb`에 배치합니다.
+좌표는 OpenCV cam0 기준(`X-right, Y-down, Z-forward`)으로 정합됩니다.
 
 ---
 
-## 3) `Obj_Step2_multiview_pose_estimation.py`
+## 4. Step 3 — 파이프라인 실행 (`run_pipeline.py`)
 
-### 3-1. 코드 설명
+### 호출 방식 3가지
 
-핵심 로직:
-
-1. `cam0/1/2` RGB-D + intrinsics + extrinsics 로드
-2. 각 카메라 depth를 점군화하고 `cam0` 좌표계로 통합
-3. RANSAC으로 테이블 평면 제거 + 높이 필터
-4. 필요 시 ROI 또는 자동 proposal로 물체 후보 crop
-5. 레퍼런스 모델(GLB/PLY)을 자동 중심/스케일 준비 후 multi-scale `FPFH + ICP` 정합
-6. 멀티뷰 depth consistency와 coverage score로 최종 포즈/스케일 선택
-7. Isaac Sim용 pose/JSON/aligned GLB 저장
-8. 각 카메라로 재투영 이미지 생성
-
-좌표계:
-
-- OpenCV cam0 기준 (`X-right, Y-down, Z-forward`)
-
-### 3-2. 실행 명령어 (모드 포함)
-
-기본 실행:
+#### A. profile JSON 1개 (단일 물체)
 
 ```bash
-python Obj_Step2_multiview_pose_estimation.py
+python3 src/run_pipeline.py \
+  --config src/configs/objects/knife.json \
+  --data_dir src/data_knife --intr_dir src/data_knife/_intrinsics \
+  --frame_id 000004
 ```
 
-프레임 변경:
+#### B. profile 여러 개 (콤마 또는 폴더)
 
 ```bash
-python Obj_Step2_multiview_pose_estimation.py --frame_id 000005
+# 콤마 구분
+python3 src/run_pipeline.py \
+  --config src/configs/objects/object_001.json,src/configs/objects/object_002.json,src/configs/objects/object_003.json,src/configs/objects/object_004.json \
+  --data_dir src/data --intr_dir src/intrinsics --frame_id 000001
+
+# 폴더 안 모든 JSON
+python3 src/run_pipeline.py \
+  --config_dir src/configs/objects \
+  --data_dir src/data --intr_dir src/intrinsics --frame_id 000001
 ```
 
-커스텀 경로 지정:
+#### C. config 없이 ad-hoc CLI (auto-detect)
 
 ```bash
-python Obj_Step2_multiview_pose_estimation.py \
-  --data_dir ./data \
-  --output_dir ./output \
-  --extrinsics_dir ./data/cube_session_01/calib_out_cube \
-  --glb_path ./data/reference_knife.glb
+python3 src/run_pipeline.py \
+  --glb path/to/new.glb \
+  --hue_ref 60 --hue_radius 15 --multicolor \
+  --init_orientation lying_flat \
+  --data_dir src/data --intr_dir src/intrinsics --frame_id 000000
 ```
 
-시각화 자동 실행 모드 (Step3 자동 호출):
+`--glb` 만 주면 GLB extent로 `init_orientation` / `symmetry` / `scale_range`를
+자동 추정 (`auto_detect_profile`). `--hue_ref` / `--multicolor` 등으로 부분 override.
+
+### Multi-frame batch
+
+`--frame_id`에 여러 형태 지원:
+
+| 형태 | 의미 |
+|------|------|
+| `000004` | 단일 |
+| `000000,000003,000005` | 콤마 리스트 |
+| `0-5` | 범위 (000000~000005) |
+| `all` | `data_dir/object_capture/cam0/rgb_*.jpg` 전체 |
 
 ```bash
-python Obj_Step2_multiview_pose_estimation.py --visualize
+# 0-2번 프레임 모두 처리
+python3 src/run_pipeline.py --config src/configs/objects/knife.json \
+  --data_dir src/data_knife --intr_dir src/data_knife/_intrinsics \
+  --frame_id 0-2
 ```
 
-주요 옵션:
+multi-frame 시 MobileSAM 가중치는 1회만 로드되어 재사용됩니다.
 
-- `--num_cameras` (기본 3)
-- `--voxel_size` (기본 `0.003` m)
-- `--roi`, `--roi_interactive`: cam0 기준 ROI 지정
-- 물체의 실측 크기를 따로 넣지 않아도 depth 기반으로 자동 스케일을 추정
-- `--disable_auto_detect`: 자동 proposal 없이 전체 물체 점군에 직접 정합
-- `--frame_mode auto_best`: 여러 프레임 중 최고 신뢰 결과 선택
-- `--visualize`: 포즈 추정 완료 후 `Obj_Step3_visualize_pose_result.py` 자동 실행
+### 결과
 
-### 3-3. 결과값
-
-기본 출력 폴더: `src3/output/`
-
-- `scene_merged.ply`: 3카메라 융합 점군
-- `objects_no_table.ply`: 테이블 제거 후 점군
-- `alignment_result.ply`: 장면 + 정합된 모델
-- `object_pointcloud.ply`: 최종 물체 점군
-- `pose_Reference_Matching.npz`: 포즈 수치(translation/rotation/quat/fitness/rmse)
-- `object_pose_sim.json`: 시뮬레이터 연동용 JSON (위치/회전/크기/4x4 변환)
-- `reprojection_cam0.png`, `reprojection_cam1.png`, `reprojection_cam2.png`: 재투영 검증
+```
+src/output/pipeline_<ts>_frame_<id>/
+├── sam_masks/<frame_id>/
+│   ├── <obj>_cam{0,1,2}.png        # SAM mask 이진 이미지
+│   └── comparison.png               # raw + 모든 마스크 overlay (3-cam grid)
+└── pose/<frame_id>/
+    ├── pose_<obj>.json              # 포즈 (position/quat/euler/scale/fitness)
+    ├── <obj>_posed.glb              # OpenCV 좌표계 posed GLB
+    ├── <obj>_posed_isaac.glb        # Isaac Sim 좌표계 posed GLB
+    ├── comparison.png               # raw + 모든 GLB silhouette (3-cam grid)
+    ├── comparison_<obj>.png         # 단일 물체 + 화살표 + 색상 텍스트박스
+    └── summary.json                 # 모든 물체 포즈 요약
+```
 
 ---
 
-## 4) `Obj_Step3_visualize_pose_result.py`
+## 5. Object profile JSON (한 물체 = 한 파일)
 
-### 4-1. 코드 설명
+자세한 옵션 표는 [`src/configs/objects/README.md`](src/configs/objects/README.md) 참조.
 
-- Step2 실행 후 `output/`에 생성된 결과를 시각화합니다.
-- matplotlib 정적 이미지 + Open3D 인터랙티브 뷰어 두 가지를 제공합니다.
-- 표시 요소:
-  - 물체 포인트클라우드 (정합된 모델, 빨간색)
-  - OBB (Oriented Bounding Box, 노란색 와이어프레임)
-  - 물체 중심에 XYZ 좌표축 + 각 축 회전값 (Euler XYZ)
-  - 회전 호(arc) 표시
-  - 크기 치수선 (L/W/H cm)
-  - 카메라 0/1/2 위치 + 시선 방향 (cam0에 "ref" 라벨)
-- 3가지 뷰 생성: Perspective / Top (XZ) / Side (XY)
+### 핵심 개념
 
-### 4-2. 실행 명령어 (모드 포함)
+| 영역 | 옵션 | 의미 |
+|------|------|------|
+| `color_prior` | `enabled`, `hue_ref`, `s_min`, `v_min` | HSV 색상 seed |
+| `multicolor` | true/false | true면 SAM 후 색상 필터링 비활성 (knife처럼 multi-color 물체) |
+| `sam.bbox_pad_ratio` | 0.0~0.5 | own bbox 확장 (multicolor면 0.30 권장) |
+| `sam.prompt_strategy` | `centroid` / `color_axis_3pt` / `cylinder_axis` / `mask_skeleton` | SAM 점 prompt (mask_skeleton: distance-transform medial axis 3점, 비대칭 / 휘어진 형태에 유용) |
+| `sam.bbox_combine` | `union` (블록) / `intersect` (knife) | own ∪ proj 또는 own ∩ proj |
+| `sam.auto_refine` | `full` / `extent_only` / `off` | SAM 후 반복 정제 강도 |
+| `shape.symmetry` | `none` / `yaw` | yaw → 실린더 (yaw_steps=1) |
+| `shape.init_orientation` | `auto` / `upright` / `lying_flat` | 모델 어떤 축을 table normal에 정렬 |
+| `shape.anisotropic_scale` | true/false | true면 render_compare가 7DOF (x/y/z 독립 스케일) Nelder-Mead 사용 |
+| `shape.horizontal_constrain` | true/false | navy 윗면 보강 등 |
+| `pose.method` | `icp_fitness` / `render_compare` | 단순 ICP vs silhouette IoU + Nelder-Mead |
+| `pose.render_topk` | int | render_compare에서 coarse top-K를 fine 단계로 |
 
-이미지 생성 + Open3D 뷰어:
-
-```bash
-python Obj_Step3_visualize_pose_result.py
-```
-
-이미지만 생성 (뷰어 생략):
+### 새 물체 추가 (가장 빠른 방법)
 
 ```bash
-python Obj_Step3_visualize_pose_result.py --no-viewer
+# 1) 가장 비슷한 profile 복사
+cp src/configs/objects/knife.json src/configs/objects/myobj.json
+
+# 2) 편집: glb 경로, hue_ref, s_min, v_min, multicolor, init_orientation
+
+# 3) 실행
+python3 src/run_pipeline.py \
+  --config src/configs/objects/myobj.json \
+  --data_dir src/data_my --intr_dir src/data_my/_intrinsics \
+  --frame_id 000000
 ```
-
-참고:
-
-- Step2에서 `--visualize` 플래그를 사용하면 자동으로 호출되므로 별도 실행 불필요
-- 단독 실행 시 `output/pose_Reference_Matching.npz`와 `output/object_pointcloud.ply` 필요
-
-### 4-3. 결과값
-
-- `src3/output/pose_visualization.png`: 3뷰 시각화 이미지 (축/회전/크기/카메라)
-- Open3D 인터랙티브 뷰어 (마우스로 회전/줌 가능)
 
 ---
 
-## 5) `Obj_Step22_Pose_Estimation_pipeline_result.py`
+## 6. 파이프라인 내부 동작
 
-### 5-1. 코드 설명
+### SAM mask (per object × per cam)
 
-- Step2 내부 과정을 단계별 그림으로 분해하는 디버그용 스크립트입니다.
-- 고정된 데이터 경로/프레임을 사용합니다.
-  - `DATA_DIR=src3/data`
-  - `frame_id="000003"`
-- Step1~Step5 중간 결과를 각각 PNG로 저장합니다.
+1. **HSV color seed**: profile의 hue/sat/val 임계로 candidate들 추출
+2. **3D-size filter**: 각 candidate를 depth로 backproject → GLB extent 대비 크기 매칭 점수
+3. **Anchor 결정**: 최고 점수 cam의 3D centroid를 anchor로 (default: cam1 우선)
+4. **bbox 결합**: own bbox ∪/∩ GLB-projected bbox (`bbox_combine`)
+5. **SAM**: bbox + prompt point(들)로 MobileSAM 호출
+6. **post-color filter** (optional): SAM 결과를 relaxed color mask와 AND
+7. **auto-refine**: 3D extent + 색상 균질성 + compactness 점수 기반 반복 정제
+   (close+largest / fill_holes / hull_fill / halo_strip / open / grabcut /
+   erode / dilate 중 점수 최고 액션 채택, 초기 영역 60% 미만으로는 안 줄임)
 
-### 5-2. 실행 명령어
+### Pose 추정
 
-```bash
-python Obj_Step22_Pose_Estimation_pipeline_result.py
-```
+**ICP fitness** (`pose.method = "icp_fitness"`):
+- 마스크 → 3D 포인트 backproject + table 위만 통과
+- `init_orientation`에 따라 GLB 가장 짧은/긴 축을 table normal에 정렬
+- yaw 후보(symmetry='yaw'면 1개) × flip(±) 그리드 → ICP 후 fitness−8·rmse 최고 선택
 
-참고:
+**render_compare** (`pose.method = "render_compare"`, 4-블록 권장):
+- Coarse: 24개 orientation × 2 flip → silhouette IoU 평가, top-K 선별
+- 각 후보에 ICP 1회 + Nelder-Mead (5 DOF: dx, dy, dz, dyaw, dscale_log) 리파인
+- Loss = 1 − cam-weighted silhouette IoU
 
-- 스크립트 내부 import는 `multiview_pose_estimation`와
-  `Obj_Step2_multiview_pose_estimation` 둘 다 대응하도록 구성되어 있습니다.
+테이블 평면은 RANSAC + 부호 보정(물체 평균이 plane 위쪽에 와야 함)으로 추정.
 
-### 5-3. 결과값
-
-출력 폴더: `src3/output/debug/`
-
-- `step1_input_images.png`: 입력 RGB/Depth
-- `step2a_per_camera.png`: 카메라별 점군(cam0 기준 변환 후)
-- `step2b_merged.png`: 통합 점군
-- `step3_table_removal.png`: 테이블 제거 결과
-- `step4a_clustering.png`: DBSCAN + 색상 매칭
-- `step4b_scaling.png`: 레퍼런스 스케일링
-- `step4c_candidates.png`: 초기정렬 5후보 비교
-- `step4d_final_icp.png`: 정밀 ICP + 최종 포즈
-- `step5_reprojection.png`: 3카메라 재투영 검증
+### 좌표계
+- 기본: OpenCV cam0 기준 (`X-right, Y-down, Z-forward`)
+- `<obj>_posed_isaac.glb`는 `T_ISAAC_CV` 변환 적용한 Isaac Sim 좌표계
 
 ---
 
-## 6) 한 번에 실행하는 권장 순서
+## 7. 의존성 그래프
 
-`src3`에서:
+```
+pose_pipeline.py
+    ↑ (import)
+pipeline_core.py        ← profile schema + SAM + pose 모두 포함
+    ↑ (import)
+    ├── run_pipeline.py        # 메인 CLI
+    └── run_knife_pipeline.py  # legacy wrapper (knife.json 기본)
+```
+
+`pipeline_core.py`는 자체 포함 라이브러리로, 외부 의존은 `pose_pipeline.py`와
+`mobile_sam`만 있습니다.
+
+---
+
+## 8. 한 번에 실행하는 권장 순서
 
 ```bash
-# 1) 촬영
-python Obj_Step1_capture_rgbd_3cam.py --save_dir ./data/object_capture
+# 1) RGB-D 촬영
+python3 src/Obj_Step1_capture_rgbd_3cam.py --save_dir src/data_my/object_capture
 
-# 2) SMA3D 웹에서 3D 추출 후 ./data/reference_knife.glb 로 저장 (수동)
+# 2) SMA3D 등에서 3D 모델 추출 후 src/data_my/myobj.glb 배치 (수동)
 
-# 3) 포즈 추정 + 시각화 (한 번에)
-python Obj_Step2_multiview_pose_estimation.py --frame_id 000003 --visualize
+# 3) profile 작성
+cp src/configs/objects/knife.json src/configs/objects/myobj.json
+# (편집)
 
-# 4) 디버그 단계별 시각화 (선택)
-python Obj_Step22_Pose_Estimation_pipeline_result.py
+# 4) 파이프라인 실행 (frame 0-5 일괄)
+python3 src/run_pipeline.py \
+  --config src/configs/objects/myobj.json \
+  --data_dir src/data_my --intr_dir src/data_my/_intrinsics \
+  --frame_id 0-5
 ```
+
+---
+
+## 9. 확장 포인트
+
+- **`prompt_strategy`**: 현재 4종 (centroid / color_axis_3pt / cylinder_axis /
+  mask_skeleton). 향후 plug-in 추가 가능 (text_prompt 등).
+- **`auto_refine` 액션**: 현재 9종 (close+largest, fill_holes, hull_fill,
+  halo_strip4/6, open5/7, grabcut, edge_snap, erode, dilate). 모두 score 기반
+  자동 선택. 추가 가능 (`split_yaw` 등).
+- 카메라 수: `pose_pipeline.load_calibration` / `load_frame` 의 `num_cams`
+  파라미터로 자동 감지 또는 명시 (default: `intrinsics_dir/cam*.npz` 카운트)
+
+## 10. method 선택 가이드
+
+| 상황 | 권장 |
+|------|------|
+| 단일 물체, 비대칭, isotropic 스케일 (knife) | `pose.method = "icp_fitness"` (빠름) |
+| 점대칭 강한 블록 / 정밀 정렬 필요 | `pose.method = "render_compare"` |
+| GLB 와 실제 비율이 axis 별로 다름 (제조 변형 등) | `pose.method = "render_compare"` + `shape.anisotropic_scale = true` (7DOF) |
+| 실린더 (yaw 대칭) | `shape.symmetry = "yaw"` (yaw 후보 1개로 단축) |
+| 누워있는 자세 (긴 축이 짧은 축의 3배 이상) | `shape.init_orientation = "lying_flat"` |

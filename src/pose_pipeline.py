@@ -188,9 +188,22 @@ COLORS = [(0,255,0), (0,165,255), (255,0,255), (0,255,255),
 # 2. 데이터 로딩
 # ═══════════════════════════════════════════════════════════
 
-def load_calibration(data_dir: Path, intrinsics_dir: Path):
+def load_calibration(data_dir: Path, intrinsics_dir: Path,
+                     num_cams: Optional[int] = None):
+    """카메라 intrinsic + extrinsic 로드.
+
+    num_cams=None 이면 `intrinsics_dir/cam*.npz` 개수에서 자동 감지.
+    extrinsic 은 `data_dir/cube_session_01/calib_out_cube/T_C0_C{ci}.npy`
+    형식으로 cam0 기준 (cam0은 항상 identity).
+    """
+    intrinsics_dir = Path(intrinsics_dir)
+    if num_cams is None:
+        cams_found = sorted(intrinsics_dir.glob("cam*.npz"))
+        num_cams = len(cams_found)
+        if num_cams == 0:
+            raise FileNotFoundError(f"intrinsics not found in {intrinsics_dir}")
     intrinsics = []
-    for ci in range(3):
+    for ci in range(num_cams):
         npz = np.load(str(intrinsics_dir / f"cam{ci}.npz"), allow_pickle=True)
         intrinsics.append(CameraIntrinsics(
             K=npz["color_K"].astype(np.float64),
@@ -198,20 +211,31 @@ def load_calibration(data_dir: Path, intrinsics_dir: Path):
             depth_scale=float(npz["depth_scale_m_per_unit"]),
             width=int(npz["color_w"]), height=int(npz["color_h"])))
 
-    ext_dir = data_dir / "cube_session_01" / "calib_out_cube"
+    ext_dir = Path(data_dir) / "cube_session_01" / "calib_out_cube"
     extrinsics = {0: np.eye(4)}
-    for ci in [1, 2]:
-        extrinsics[ci] = np.load(str(ext_dir / f"T_C0_C{ci}.npy")).astype(np.float64)
+    for ci in range(1, num_cams):
+        ext_file = ext_dir / f"T_C0_C{ci}.npy"
+        if not ext_file.exists():
+            raise FileNotFoundError(f"missing extrinsic: {ext_file}")
+        extrinsics[ci] = np.load(str(ext_file)).astype(np.float64)
     return intrinsics, extrinsics
 
 
 def load_frame(data_dir: Path, frame_id: str, intrinsics, extrinsics,
-               capture_subdir: str = "object_capture"):
-    img_dir = data_dir / capture_subdir
+               capture_subdir: str = "object_capture",
+               num_cams: Optional[int] = None):
+    """frame_id 의 RGB-D 를 모든 카메라에서 로드.
+
+    num_cams=None 이면 intrinsics 길이를 사용.
+    """
+    if num_cams is None:
+        num_cams = len(intrinsics)
+    img_dir = Path(data_dir) / capture_subdir
     frames = []
-    for ci in range(3):
+    for ci in range(num_cams):
         c = cv2.imread(str(img_dir / f"cam{ci}" / f"rgb_{frame_id}.jpg"))
-        d = cv2.imread(str(img_dir / f"cam{ci}" / f"depth_{frame_id}.png"), cv2.IMREAD_UNCHANGED)
+        d = cv2.imread(str(img_dir / f"cam{ci}" / f"depth_{frame_id}.png"),
+                       cv2.IMREAD_UNCHANGED)
         if c is None or d is None:
             raise FileNotFoundError(f"{capture_subdir}/cam{ci}/frame_{frame_id}")
         frames.append(CameraFrame(ci, intrinsics[ci], extrinsics[ci], c, d))

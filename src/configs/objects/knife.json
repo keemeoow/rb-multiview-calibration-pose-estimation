@@ -1,0 +1,47 @@
+{
+  "name": "knife",
+  "label": "yellow box-cutter",
+  "glb": "src/data_knife/reference_knife.glb",
+  "overlay_color_bgr": [
+    40,
+    220,
+    220
+  ],
+  "color_prior": {
+    "enabled": true,
+    "hue_ref": 24.0,
+    "hue_radius": 14.0,
+    "s_min": 110,
+    "v_min": 100,
+    "v_max": 255,
+    "relaxed_hue_radius": 22.0
+  },
+  "multicolor": true,
+  "sam": {
+    "bbox_pad_ratio": 0.3,
+    "prompt_strategy": "color_axis_3pt",
+    "post_color_intersect": false,
+    "auto_refine": "off",
+    "reliability_threshold": 0.1,
+    "own_bbox_max_image_ratio": 0.7,
+    "scale_range_min": 0.05,
+    "scale_range_max": 1.5,
+    "bbox_combine": "intersect"
+  },
+  "shape": {
+    "symmetry": "none",
+    "init_orientation": "lying_flat",
+    "yaw_steps": 24,
+    "anisotropic_scale": false,
+    "horizontal_constrain": false
+  },
+  "pose": {
+    "method": "render_compare",
+    "icp_voxel": 0.005,
+    "icp_max_iter": 80,
+    "render_topk": 2,
+    "render_max_iter": 80,
+    "render_simplify_faces": 1500,
+    "render_orientation_grid": 12
+  }
+}
