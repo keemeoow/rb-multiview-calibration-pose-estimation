@@ -2,6 +2,8 @@
 # 멀티캠 캡처 (Step4까지 할 거면 depth 저장 필수)
 
 """
+Depth는 기본 저장 (Step3/4에서 필수). depth를 끄려면 --no_save_depth.
+
 [최소 마커 인식 1개 이상]
 python Step2_capture_multi_cam.py \
   --root_folder ./data/cube_session_01 \
@@ -13,10 +15,9 @@ python Step2_capture_multi_cam.py \
 python Step2_capture_multi_cam.py \
   --root_folder ./data/cube_session_01 \
   --intrinsics_dir ./intrinsics \
-  --fps 15 --width 640 --height 480 \  
+  --fps 15 --width 640 --height 480 \
   --min_markers 2 \
   --auto_save --stable_frames 3 --cooldown_ms 700 \
-  --save_depth \
   --show
 """
 
@@ -70,7 +71,10 @@ def main():
     parser.add_argument("--stable_frames", type=int, default=3)
     parser.add_argument("--cooldown_ms", type=int, default=700)
 
-    parser.add_argument("--save_depth", action="store_true")
+    parser.add_argument("--save_depth", dest="save_depth", action="store_true", default=True,
+                        help="Save aligned depth (default: ON).")
+    parser.add_argument("--no_save_depth", dest="save_depth", action="store_false",
+                        help="Disable depth saving.")
     parser.add_argument("--no_align_depth_to_color", action="store_true")
     parser.add_argument("--camera_frame_timeout_ms", type=int, default=2000)
     parser.add_argument("--log_cam_timeouts", action="store_true")

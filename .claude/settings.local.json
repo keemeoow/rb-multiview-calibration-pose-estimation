@@ -20,7 +20,15 @@
       "Bash(kill 88588 88589 88590 88591)",
       "Bash(ls src/data/object_capture_blocks\\\\\\(1\\\\\\)/cam0/rgb_*.jpg)",
       "Bash(ls src/data/object_capture_blocks\\\\\\(1\\\\\\)/cam0/*.json)",
-      "Bash(ls src/data/object_capture_blocks\\\\\\(1\\\\\\)/cam0/*.labelme*)"
+      "Bash(ls src/data/object_capture_blocks\\\\\\(1\\\\\\)/cam0/*.labelme*)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '../..'\\); from src._camera import RealSenseCamera; print\\('OK:', RealSenseCamera\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python3 -c ' *)"
+    ],
+    "additionalDirectories": [
+      "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src"
     ]
   }
 }
