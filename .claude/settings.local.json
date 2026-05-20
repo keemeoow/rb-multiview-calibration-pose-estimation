@@ -25,7 +25,9 @@
       "Bash(git show *)",
       "Bash(python -c \"import sys; sys.path.insert\\(0, '../..'\\); from src._camera import RealSenseCamera; print\\('OK:', RealSenseCamera\\)\")",
       "Bash(python -c ' *)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import numpy as np; z=np.load\\('/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/Step0_calibration/intrinsics/cam0.npz'\\); print\\(list\\(z.keys\\(\\)\\)\\)\")",
+      "Bash(python verify_calibration_accuracy.py --root_folder ./data/cube_session_01 --intrinsics_dir ./intrinsics --ref_cam_idx 0 --out_csv ./data/cube_session_01/calib_out_cube/calib_results/accuracy_report.csv)"
     ],
     "additionalDirectories": [
       "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src"
