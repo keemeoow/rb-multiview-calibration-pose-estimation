@@ -20,10 +20,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -172,6 +173,72 @@ def load_masks(mask_dir: str | Path, cameras: Dict[str, CameraPacket]) -> Dict[s
         masks[cam_id] = mask > 0
 
     return masks
+
+
+def load_masks_per_object(
+    mask_dir: str | Path,
+    cameras: Dict[str, CameraPacket],
+    obj_ids: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    다중 인스턴스 마스크 로더.
+
+    지원 파일 패턴 (둘 중 하나):
+      1) mask_dir/{cam_id}_obj{obj_id}_mask.png   ← 다중 물체
+      2) mask_dir/{cam_id}_mask.png               ← 단일 물체 (obj_id="0" 처리)
+
+    멀티뷰 인스턴스 매칭(같은 obj_id가 카메라 간 같은 물체임을 보장)은 호출자(예: SAM2
+    multi-view propagation) 책임이다. 이 함수는 동일한 obj_id를 같은 물체로 가정한다.
+
+    obj_ids 미지정시 mask_dir에서 검출된 모든 obj_id 사용.
+
+    반환: {obj_id: {cam_id: bool mask}}
+    """
+    mask_dir = Path(mask_dir)
+    masks_by_obj: Dict[str, Dict[str, np.ndarray]] = {}
+
+    pat = re.compile(r"^(?P<cam>cam[^_]+)_obj(?P<obj>[^_]+)_mask\.[A-Za-z0-9]+$")
+    multi_files = []
+    for fp in mask_dir.iterdir():
+        if not fp.is_file():
+            continue
+        m = pat.match(fp.name)
+        if m:
+            multi_files.append((m.group("cam"), m.group("obj"), fp))
+
+    if multi_files:
+        for cam_id, obj_id, fp in multi_files:
+            if cam_id not in cameras:
+                print(f"[WARN] mask file references unknown cam_id={cam_id}: {fp.name}")
+                continue
+            if obj_ids is not None and obj_id not in obj_ids:
+                continue
+            mk = cv2.imread(str(fp), cv2.IMREAD_GRAYSCALE)
+            if mk is None:
+                raise FileNotFoundError(f"Mask not readable: {fp}")
+            cam = cameras[cam_id]
+            if mk.shape != cam.depth.shape:
+                raise ValueError(
+                    f"Mask/depth size mismatch in {cam_id}/obj{obj_id}: "
+                    f"mask={mk.shape}, depth={cam.depth.shape}"
+                )
+            masks_by_obj.setdefault(obj_id, {})[cam_id] = mk > 0
+    else:
+        # 단일 물체 fallback: obj_id="0"으로 묶는다.
+        if obj_ids is not None and "0" not in obj_ids:
+            raise FileNotFoundError(
+                f"No cam*_obj*_mask.* files in {mask_dir} and requested obj_ids={obj_ids} "
+                f"do not include the fallback id '0'."
+            )
+        single = load_masks(mask_dir, cameras)
+        masks_by_obj["0"] = single
+
+    if not masks_by_obj:
+        raise FileNotFoundError(
+            f"No usable object masks found in {mask_dir} (obj_ids filter={obj_ids})."
+        )
+
+    return masks_by_obj
 
 
 # ============================================================
@@ -595,11 +662,19 @@ def main() -> None:
     parser.add_argument("--voxel_size", type=float, default=0.002, help="meter. 0.002 = 2 mm")
     parser.add_argument("--use_oriented_bbox", action="store_true")
 
+    parser.add_argument("--obj_ids", default="",
+                        help="Comma-separated object ids to process (e.g. '1,3,5'). "
+                             "Empty = all detected from cam*_obj*_mask filenames. "
+                             "단일 물체(cam*_mask.png)인 경우 '0' 사용.")
+
     parser.add_argument("--run_instantmesh", action="store_true")
     parser.add_argument("--instantmesh_root", default="InstantMesh")
     parser.add_argument("--instantmesh_config", default="configs/instant-mesh-large.yaml")
     parser.add_argument("--instantmesh_python", default="python")
-    parser.add_argument("--instantmesh_mesh", default="", help="If already generated, pass output obj/glb path here")
+    parser.add_argument("--instantmesh_mesh", default="",
+                        help="Pre-generated InstantMesh 결과 경로. "
+                             "단일 파일이면 단일 물체 모드에만 적용. "
+                             "디렉토리면 그 안의 obj{id}.glb/.obj/.ply 를 obj id별로 매칭.")
 
     parser.add_argument("--scale_mode", choices=["mean", "median", "max"], default="median")
     parser.add_argument("--apply_world_pose", action="store_true")
@@ -613,101 +688,142 @@ def main() -> None:
     cameras = load_cameras_from_folder(args.data_dir, depth_scale=args.depth_scale)
     print(f"Loaded cameras: {list(cameras.keys())}")
 
-    # 2. Load SAM/SAM2 masks
-    masks = load_masks(args.mask_dir, cameras)
+    # 2. Load SAM/SAM2 masks per object
+    selected_obj_ids = [s.strip() for s in args.obj_ids.split(",") if s.strip()] or None
+    masks_by_obj = load_masks_per_object(args.mask_dir, cameras, obj_ids=selected_obj_ids)
+    print(f"Objects to process: {sorted(masks_by_obj.keys())}")
 
-    # 3. Merge masked depth points into world frame
-    points, colors = merge_multiview_cloud(
-        cameras=cameras,
-        masks=masks,
-        min_depth=args.min_depth,
-        max_depth=args.max_depth,
-        stride=args.stride,
-    )
-    print(f"Merged raw cloud points: {len(points)}")
+    instantmesh_mesh_arg = Path(args.instantmesh_mesh) if args.instantmesh_mesh else None
+    instantmesh_mesh_is_dir = bool(instantmesh_mesh_arg and instantmesh_mesh_arg.is_dir())
 
-    # 4. Filter cloud and estimate metric bbox
-    clean_points, clean_colors = filter_cloud_open3d(
-        points,
-        colors,
-        voxel_size=args.voxel_size,
-        nb_neighbors=30,
-        std_ratio=2.0,
-        radius=max(args.voxel_size * 4.0, 0.006),
-        min_points=8,
-    )
-    print(f"Clean cloud after Open3D filter: {len(clean_points)}")
+    results_summary: Dict[str, dict] = {}
 
-    # LOF는 선택적 추가 필터. 너무 공격적이면 실제 물체 끝부분이 잘릴 수 있음.
-    clean_points_lof = filter_cloud_lof(clean_points, n_neighbors=30, contamination=0.03)
-    print(f"Clean cloud after LOF: {len(clean_points_lof)}")
+    for obj_id in sorted(masks_by_obj.keys()):
+        per_cam_masks = masks_by_obj[obj_id]
+        obj_tag = f"obj{obj_id}"
+        print(f"\n=== Processing {obj_tag} (cameras: {sorted(per_cam_masks.keys())}) ===")
 
-    if clean_colors is not None and len(clean_colors) == len(clean_points):
-        # LOF 이후 color index가 바뀌므로 여기서는 단순히 color 없이 저장
-        save_cloud_ply(out_dir / "object_cloud_clean.ply", clean_points_lof, None)
-    else:
-        save_cloud_ply(out_dir / "object_cloud_clean.ply", clean_points_lof, None)
+        obj_cams = {cid: cameras[cid] for cid in per_cam_masks.keys()}
 
-    center_world, bbox_extents_m, R_bbox_to_world = estimate_metric_bbox(
-        clean_points_lof,
-        use_oriented_bbox=args.use_oriented_bbox,
-    )
+        # 3. Merge masked depth points into world frame
+        points, colors = merge_multiview_cloud(
+            cameras=obj_cams,
+            masks=per_cam_masks,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            stride=args.stride,
+        )
+        print(f"[{obj_tag}] Merged raw cloud points: {len(points)}")
 
-    bbox_info = {
-        "center_world_m": center_world.tolist(),
-        "bbox_extents_m": bbox_extents_m.tolist(),
-        "R_bbox_to_world": R_bbox_to_world.tolist(),
-        "use_oriented_bbox": bool(args.use_oriented_bbox),
-    }
-    with open(out_dir / "bbox_metric.json", "w", encoding="utf-8") as f:
-        json.dump(bbox_info, f, indent=2)
+        # 4. Filter cloud and estimate metric bbox
+        clean_points, _ = filter_cloud_open3d(
+            points,
+            colors,
+            voxel_size=args.voxel_size,
+            nb_neighbors=30,
+            std_ratio=2.0,
+            radius=max(args.voxel_size * 4.0, 0.006),
+            min_points=8,
+        )
+        print(f"[{obj_tag}] Clean cloud after Open3D filter: {len(clean_points)}")
 
-    print("Metric bbox:")
-    print(json.dumps(bbox_info, indent=2))
+        clean_points_lof = filter_cloud_lof(clean_points, n_neighbors=30, contamination=0.03)
+        print(f"[{obj_tag}] Clean cloud after LOF: {len(clean_points_lof)}")
 
-    # 5. Choose best view and save RGBA for InstantMesh
-    best_cam = choose_best_view(cameras, masks)
-    print(f"Best view for InstantMesh: {best_cam}")
+        if len(clean_points_lof) < 10:
+            print(f"[{obj_tag}] Skip: too few points after filtering.")
+            continue
 
-    input_png = out_dir / "object_input.png"
-    save_rgba_input(
-        rgb=cameras[best_cam].rgb,
-        mask=masks[best_cam],
-        out_path=input_png,
-        crop=True,
-        padding=30,
-        output_size=512,
-    )
+        save_cloud_ply(out_dir / f"{obj_tag}_cloud_clean.ply", clean_points_lof, None)
 
-    # 6. Run InstantMesh if requested
-    if args.run_instantmesh:
-        run_instantmesh(
-            instantmesh_root=args.instantmesh_root,
-            config_path=args.instantmesh_config,
-            input_png=input_png.resolve(),
-            output_dir=out_dir / "instantmesh_output",
-            python_bin=args.instantmesh_python,
-            no_rembg=True,
-            export_texmap=True,
+        center_world, bbox_extents_m, R_bbox_to_world = estimate_metric_bbox(
+            clean_points_lof,
+            use_oriented_bbox=args.use_oriented_bbox,
         )
 
-    # 7. Scale InstantMesh mesh to metric GLB
-    if args.instantmesh_mesh:
-        mesh_path = Path(args.instantmesh_mesh)
-        if not mesh_path.exists():
-            raise FileNotFoundError(f"InstantMesh mesh not found: {mesh_path}")
+        bbox_info = {
+            "obj_id": obj_id,
+            "center_world_m": center_world.tolist(),
+            "bbox_extents_m": bbox_extents_m.tolist(),
+            "R_bbox_to_world": R_bbox_to_world.tolist(),
+            "use_oriented_bbox": bool(args.use_oriented_bbox),
+        }
+        with open(out_dir / f"{obj_tag}_bbox_metric.json", "w", encoding="utf-8") as f:
+            json.dump(bbox_info, f, indent=2)
+        print(f"[{obj_tag}] metric bbox:")
+        print(json.dumps(bbox_info, indent=2))
 
-        scale_mesh_to_metric_bbox(
-            mesh_path=mesh_path,
-            bbox_extents_m=bbox_extents_m,
-            out_glb_path=out_dir / "object_scaled.glb",
-            center_world=center_world,
-            R_bbox_to_world=R_bbox_to_world,
-            scale_mode=args.scale_mode,
-            apply_world_pose=args.apply_world_pose,
+        # 5. Choose best view and save RGBA for InstantMesh
+        best_cam = choose_best_view(obj_cams, per_cam_masks)
+        print(f"[{obj_tag}] Best view for InstantMesh: {best_cam}")
+
+        input_png = out_dir / f"{obj_tag}_input.png"
+        save_rgba_input(
+            rgb=obj_cams[best_cam].rgb,
+            mask=per_cam_masks[best_cam],
+            out_path=input_png,
+            crop=True,
+            padding=30,
+            output_size=512,
         )
-    else:
-        print("Skip mesh scaling because --instantmesh_mesh was not provided.")
+
+        # 6. Run InstantMesh if requested (per object)
+        if args.run_instantmesh:
+            im_out = out_dir / "instantmesh_output" / obj_tag
+            run_instantmesh(
+                instantmesh_root=args.instantmesh_root,
+                config_path=args.instantmesh_config,
+                input_png=input_png.resolve(),
+                output_dir=im_out,
+                python_bin=args.instantmesh_python,
+                no_rembg=True,
+                export_texmap=True,
+            )
+
+        # 7. Scale InstantMesh mesh to metric GLB
+        mesh_path: Optional[Path] = None
+        if instantmesh_mesh_arg is not None:
+            if instantmesh_mesh_is_dir:
+                for ext in (".glb", ".obj", ".ply"):
+                    cand = instantmesh_mesh_arg / f"{obj_tag}{ext}"
+                    if cand.exists():
+                        mesh_path = cand
+                        break
+                if mesh_path is None:
+                    print(f"[{obj_tag}] No mesh file found in {instantmesh_mesh_arg} for this obj.")
+            elif len(masks_by_obj) == 1:
+                # 단일 물체 모드 + 단일 파일 인자: 그대로 사용
+                if instantmesh_mesh_arg.exists():
+                    mesh_path = instantmesh_mesh_arg
+                else:
+                    raise FileNotFoundError(f"InstantMesh mesh not found: {instantmesh_mesh_arg}")
+            else:
+                print(f"[{obj_tag}] --instantmesh_mesh 는 다중 물체에서 디렉토리여야 합니다. skip.")
+
+        if mesh_path is not None:
+            out_glb = out_dir / f"{obj_tag}_scaled.glb"
+            scale = scale_mesh_to_metric_bbox(
+                mesh_path=mesh_path,
+                bbox_extents_m=bbox_extents_m,
+                out_glb_path=out_glb,
+                center_world=center_world,
+                R_bbox_to_world=R_bbox_to_world,
+                scale_mode=args.scale_mode,
+                apply_world_pose=args.apply_world_pose,
+            )
+            results_summary[obj_id] = {
+                "scaled_glb": str(out_glb),
+                "scale": scale,
+                "bbox_extents_m": bbox_extents_m.tolist(),
+                "center_world_m": center_world.tolist(),
+            }
+        else:
+            print(f"[{obj_tag}] Skip mesh scaling (no mesh provided for this object).")
+
+    if results_summary:
+        with open(out_dir / "objects_summary.json", "w", encoding="utf-8") as f:
+            json.dump(results_summary, f, indent=2)
+        print(f"\nSaved per-object summary: {out_dir / 'objects_summary.json'}")
 
 
 if __name__ == "__main__":
