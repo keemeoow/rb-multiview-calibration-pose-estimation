@@ -7,9 +7,9 @@ ObjectProfile (JSON) 한 파일이 한 물체의 SAM-mask + pose 동작을 모�
 이 모듈은 라이브러리이며, CLI는 `run_pipeline.py` 가 담당.
 
 자체 포함:
-  - SAM 마스크 helper: glb_extent, mask_3d_info, project_bbox_from_3d,
-    cylinder_axis_points, run_sam, keep_nearest_component, auto_refine_mask,
-    evaluate_mask_quality, _navy_top_face_mask 등 모두 본 파일에 정의.
+  - SAM 마스크 helper: glb_extent, mask_3d_info, mask_3d_info_multiview,
+    project_bbox_from_3d, cylinder_axis_points, run_sam, keep_nearest_component,
+    auto_refine_mask, evaluate_mask_quality, _navy_top_face_mask 등 모두 본 파일에 정의.
   - Pose 추정: ICP fitness + render_compare (silhouette IoU + Nelder-Mead).
   - 외부 의존: pose_pipeline (load_calibration, load_frame, normalize_glb,
     estimate_table_plane), mobile_sam (SamPredictor, sam_model_registry).
@@ -70,6 +70,119 @@ def mask_3d_info(mask: np.ndarray, cam) -> Optional[dict]:
     ext = hi - lo
     return {"centroid": centroid, "extent": ext,
             "max_extent": float(ext.max()), "n_pts": int(m.sum())}
+
+
+def _unproject_mask_to_base(mask: np.ndarray, cam,
+                            z_min: float = 0.05, z_max: float = 1.5,
+                            min_points: int = 30) -> Optional[np.ndarray]:
+    """단일 (mask, cam)을 base 좌표계의 (N, 3) 점군으로 변환. 부족하면 None."""
+    depth = cam.depth_u16.astype(np.float64) * cam.intrinsics.depth_scale
+    K = cam.intrinsics.K
+    m = (mask > 0) & (depth > z_min) & (depth < z_max)
+    if int(m.sum()) < min_points:
+        return None
+    ys, xs = np.where(m)
+    z = depth[ys, xs]
+    x_cam = (xs - K[0, 2]) * z / K[0, 0]
+    y_cam = (ys - K[1, 2]) * z / K[1, 1]
+    pts_cam = np.stack([x_cam, y_cam, z], axis=-1)
+    R = cam.T_base_cam[:3, :3]; t = cam.T_base_cam[:3, 3]
+    return (R @ pts_cam.T).T + t
+
+
+def mask_3d_info_multiview(views: List[Tuple[np.ndarray, Any]],
+                           z_min: float = 0.05,
+                           z_max: float = 1.5,
+                           voxel_size_m: float = 0.003,
+                           percentile_lo: float = 2.0,
+                           percentile_hi: float = 98.0) -> Optional[dict]:
+    """모든 뷰의 (mask, depth) → base frame point cloud → PCA 기반 OBB.
+
+    단일 뷰 `mask_3d_info`의 AABB 가 카메라 외부 파라미터 오차 1방향으로 부풀려지는 문제를
+    피하기 위해, 여러 뷰 점군을 합쳐 PCA 주축 기준 OBB 를 추정한다.
+
+    Args:
+        views: [(mask, cam), ...] cam은 mask_3d_info와 동일한 인터페이스 (depth_u16,
+               intrinsics.{K,depth_scale}, T_base_cam) 를 가져야 한다.
+        voxel_size_m: 0 이면 비활성. 다중 뷰가 같은 표면을 중복 샘플링하므로 voxel down
+                      sample 하면 PCA 가 카메라 간 점 밀도 차에 흔들리지 않는다.
+        percentile_lo/hi: PCA local 좌표축별 robust extent 산정용.
+
+    Returns:
+        {
+          "centroid":    (3,)  base frame OBB 중심,
+          "extent":      (3,)  PCA 축 정렬 길이 (큰 순),
+          "max_extent":  float,
+          "n_pts":       int,  voxel down 이후 사용된 점 수,
+          "R":           (3,3) PCA 회전 행렬 (열 = base frame 표현 주축),
+          "corners":     (8,3) OBB 모서리 base frame 좌표 (project_bbox_from_3d 호환),
+          "n_views":     int,  실제 기여한 카메라 수,
+        }
+    """
+    if not views:
+        return None
+
+    cloud_chunks: List[np.ndarray] = []
+    n_views_used = 0
+    for mask, cam in views:
+        pts = _unproject_mask_to_base(mask, cam, z_min=z_min, z_max=z_max)
+        if pts is None:
+            continue
+        cloud_chunks.append(pts)
+        n_views_used += 1
+
+    if not cloud_chunks:
+        return None
+
+    pts_base = np.concatenate(cloud_chunks, axis=0)
+
+    # 카메라 간 점 밀도 차이 평탄화 (PCA 가중을 막기 위해)
+    if voxel_size_m and voxel_size_m > 0 and len(pts_base) > 0:
+        idx = np.floor(pts_base / voxel_size_m).astype(np.int64)
+        # 정수 voxel 좌표를 row 단위로 unique 처리 → 첫 점만 보존
+        _, keep = np.unique(idx, axis=0, return_index=True)
+        pts_base = pts_base[np.sort(keep)]
+
+    n_pts = int(pts_base.shape[0])
+    if n_pts < 30:
+        return None
+
+    # PCA: 분산이 큰 순서대로 정렬된 정규직교 축
+    mean = pts_base.mean(axis=0)
+    centered = pts_base - mean
+    cov = (centered.T @ centered) / max(n_pts - 1, 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)             # ascending
+    order = np.argsort(eigvals)[::-1]
+    R_pca = eigvecs[:, order]                          # columns = principal axes
+    # det=+1 보장 (좌표계 반전 방지)
+    if np.linalg.det(R_pca) < 0:
+        R_pca[:, -1] *= -1
+
+    local = centered @ R_pca                            # base → PCA local
+    lo = np.percentile(local, percentile_lo, axis=0)
+    hi = np.percentile(local, percentile_hi, axis=0)
+    extent = hi - lo
+    # OBB 중심은 percentile 박스 중심 (outlier 영향 최소화)
+    center_local = (lo + hi) / 2.0
+    centroid = mean + R_pca @ center_local
+
+    # 8 corners (base frame)
+    half = extent / 2.0
+    signs = np.array([(sx, sy, sz)
+                      for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)],
+                     dtype=np.float64)
+    corners_local = signs * half
+    corners_base = (R_pca @ corners_local.T).T + centroid
+
+    return {
+        "centroid":   centroid,
+        "extent":     extent,
+        "max_extent": float(extent.max()),
+        "n_pts":      n_pts,
+        "R":          R_pca,
+        "corners":    corners_base,
+        "n_views":    int(n_views_used),
+    }
 
 
 def project_bbox_from_3d(centroid: np.ndarray, extent: np.ndarray, cam,

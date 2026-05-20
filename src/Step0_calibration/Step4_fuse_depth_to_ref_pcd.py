@@ -1,54 +1,6 @@
 # Step4_fuse_depth_to_ref_pcd.py
 # 전체 프레임 기반 검증/통합 + 단일 프레임 시각화
 """
-[결과만 잘나오게]
-python Step4_fuse_depth_to_ref_pcd.py \
-  --root_folder ./data/cube_session_01 \
-  --intrinsics_dir ./intrinsics \
-  --ref_cam_idx 0 \
-  --frame_idx 0 \
-  --auto_best_frame \
-  --use_depth \
-  --save_overlay \
-  --depth_pose_mode frame \
-  --depth_cube_roi_margin_m 0.05 \
-  --depth_z_min 0.2 \
-  --depth_z_max 1.5 \
-  --depth_auto_z_window_m 0.10 \
-  --depth_stride 2
-"""
-"""
-[roi 없이]
-python Step4_fuse_depth_to_ref_pcd.py \
-  --root_folder ./data/cube_session_01 \
-  --intrinsics_dir ./intrinsics \
-  --ref_cam_idx 0 \
-  --frame_idx 0 \
-  --auto_best_frame \
-  --use_depth \
-  --save_overlay \
-  --depth_pose_mode frame \
-  --depth_dense_no_roi \
-  --depth_vis_max_points 120000
-"""
-"""
-python Step4_fuse_depth_to_ref_pcd.py \
-  --root_folder ./data/cube_session_01 \
-  --intrinsics_dir ./intrinsics \
-  --ref_cam_idx 0 \
-  --frame_idx 0 \
-  --use_depth \
-  --save_overlay \
-  --depth_cube_roi_margin_m 0.06
-"""
-"""
-python Step4_fuse_depth_to_ref_pcd.py \
-  --root_folder ./data/cube_session_01 \
-  --intrinsics_dir ./intrinsics \
-  --ref_cam_idx 0 \
-  --frame_idx 0 \
-  --save_overlay
-
 설명:
 - 계산: 전체 프레임 사용 (PnP / cross-camera reprojection / 전역 큐브 pose 추정)
 - 시각화: --frame_idx 한 프레임만 사용 (기본 0)
@@ -59,16 +11,15 @@ python Step4_fuse_depth_to_ref_pcd.py \
   --root_folder ./data/cube_session_01 \
   --intrinsics_dir ./intrinsics \
   --ref_cam_idx 0 \
-  --frame_idx 0 \
-  --auto_best_frame \
+  --frame_idx 7 \
   --use_depth \
-  --depth_all_frames \
   --save_overlay \
   --depth_pose_mode frame \
-  --depth_stride 2 \
-  --depth_voxel_size_m 0.002 \
+  --depth_cube_roi_margin_m 0.05 \
   --depth_z_min 0.2 \
-  --depth_z_max 1.5
+  --depth_z_max 1.5 \
+  --depth_auto_z_window_m 0.10 \
+  --depth_stride 2
 """
 
 import os
@@ -85,12 +36,17 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 # open3d 는 선택적 의존성; 없어도 PLY 저장 + matplotlib로 대체
 
-from _aruco_cube import CubeConfig, ArucoCubeModel, ArucoCubeTarget, rodrigues_to_Rt
+from _aruco_cube import CubeConfig, ArucoCubeModel, ArucoCubeTarget, rodrigues_to_Rt, inv_T
 
 try:
     from _utils_pose import robust_se3_average
 except Exception:
     robust_se3_average = None
+
+
+# ref cam pose와의 회전 편차가 이 임계값(deg)을 넘으면 단일 마커 IPPE flip으로 간주하고
+# ref cam pose를 prior로 사용해 PnP를 재해소한다.
+FLIP_ROT_DEG_THRESH = 30.0
 
 
 def ensure_dir(p: str) -> str:
@@ -229,7 +185,7 @@ def collect_pnp_all_frames(
                 D_map[ci],
                 min_markers=1,
                 reproj_thr_mean_px=reproj_max_px,
-                single_marker_only=True,
+                single_marker_only=False,
                 return_reproj=True,
             )
             if not ok or reproj is None:
@@ -256,6 +212,91 @@ def collect_pnp_all_frames(
         )
 
     return pnp_by_frame
+
+
+def resolve_ippe_flips_with_prior(
+    pnp_by_frame: Dict[int, Dict[int, dict]],
+    T_ref: Dict[int, np.ndarray],
+    ref_cam_idx: int,
+    root_folder: str,
+    cube: ArucoCubeTarget,
+    K_map: Dict[int, np.ndarray],
+    D_map: Dict[int, np.ndarray],
+    reproj_max_px: float,
+    rot_deg_threshold: float = FLIP_ROT_DEG_THRESH,
+) -> int:
+    """
+    ref cam pose를 prior로 비참조 카메라의 단일 마커 IPPE flip을 재해소.
+    Step3와 동일한 패턴: T_ref @ T_Ci_O 가 ref cam의 T_Cref_O와 회전 편차가 큰 경우,
+    ref cam pose를 cam_i 시점으로 변환해 prior로 넘겨 PnP를 다시 푼다.
+    """
+    if ref_cam_idx not in T_ref:
+        return 0
+
+    rescued = 0
+    rescued_by_cam: Dict[int, List[int]] = {}
+
+    for fid, frame_res in pnp_by_frame.items():
+        if ref_cam_idx not in frame_res:
+            continue
+        ref_res = frame_res[ref_cam_idx]
+        T_Cref_O_ref = rodrigues_to_Rt(ref_res["rvec"], ref_res["tvec"])
+
+        for ci in list(frame_res.keys()):
+            if ci == ref_cam_idx or ci not in T_ref:
+                continue
+            res = frame_res[ci]
+            T_Ci_O = rodrigues_to_Rt(res["rvec"], res["tvec"])
+            T_Cref_O_pred = T_ref[ci] @ T_Ci_O
+            rot_dev = rotation_angle_deg(T_Cref_O_pred[:3, :3], T_Cref_O_ref[:3, :3])
+            if rot_dev <= rot_deg_threshold:
+                continue
+
+            rgb_path = os.path.join(root_folder, f"cam{ci}", f"rgb_{fid:05d}.jpg")
+            if not os.path.exists(rgb_path):
+                continue
+            img = cv2.imread(rgb_path)
+            if img is None:
+                continue
+
+            prior_T_Ci_O = inv_T(T_ref[ci]) @ T_Cref_O_ref
+            ok, rvec, tvec, used, reproj = cube.solve_pnp_cube(
+                img, K_map[ci], D_map[ci],
+                min_markers=1,
+                reproj_thr_mean_px=reproj_max_px,
+                single_marker_only=False,
+                return_reproj=True,
+                prior_T_C_O=prior_T_Ci_O,
+            )
+            if not ok or reproj is None:
+                continue
+
+            T_Ci_O_new = rodrigues_to_Rt(rvec, tvec)
+            T_Cref_O_new = T_ref[ci] @ T_Ci_O_new
+            new_dev = rotation_angle_deg(T_Cref_O_new[:3, :3], T_Cref_O_ref[:3, :3])
+            if new_dev > rot_deg_threshold:
+                continue  # 여전히 모호 → 포기
+
+            frame_res[ci] = {
+                "rvec": rvec,
+                "tvec": tvec,
+                "reproj": reproj,
+                "used": [int(x) for x in used],
+            }
+            rescued += 1
+            rescued_by_cam.setdefault(ci, []).append(fid)
+
+    if rescued > 0:
+        for ci in sorted(rescued_by_cam):
+            fids = sorted(rescued_by_cam[ci])
+            tail = "..." if len(fids) > 10 else ""
+            print(
+                f"[INFO] IPPE rescue cam{ci}: {len(fids)} frames re-solved "
+                f"(>{rot_deg_threshold:.0f}° rot dev) {fids[:10]}{tail}"
+            )
+    else:
+        print(f"[INFO] IPPE rescue: 0 (no frames exceeded {rot_deg_threshold:.0f}° rot dev)")
+    return rescued
 
 
 def build_ref_pose_observations(
@@ -759,8 +800,15 @@ def _fuse_depth_single_frame(
     roi_half: Optional[np.ndarray],
     T_cube_depth: np.ndarray,
     verbose: bool = True,
+    z_window_half_m: Optional[float] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """단일 프레임의 모든 카메라 depth를 ref 좌표계로 변환하여 반환."""
+    """단일 프레임의 모든 카메라 depth를 ref 좌표계로 변환하여 반환.
+
+    z_window_half_m: not None이면 큐브 중심을 *각 카메라 좌표계*로 변환해
+        z ± z_window_half_m 범위로 좁힌 뒤 base (z_min, z_max)와 교집합을 사용.
+        ref 좌표계 z만 기준으로 좁힐 경우 다른 카메라의 큐브가 z-window 밖으로
+        벗어나 silently drop되는 문제를 해결한다.
+    """
     frame_pts: List[np.ndarray] = []
     frame_cols: List[np.ndarray] = []
     for ci in cam_indices:
@@ -785,8 +833,23 @@ def _fuse_depth_single_frame(
         if ds is None or np.isnan(ds):
             ds = 0.001
 
-        pts_cam, pix = depth_to_points_cam(depth_u16, K_map[ci], ds, z_min, z_max, stride)
+        if z_window_half_m is not None:
+            T_Ci_cube = inv_T(T_ref[ci]) @ T_cube_depth
+            zc_ci = float(T_Ci_cube[2, 3])
+            z_min_ci = max(z_min, zc_ci - float(z_window_half_m))
+            z_max_ci = min(z_max, zc_ci + float(z_window_half_m))
+            if z_max_ci <= z_min_ci:
+                if verbose:
+                    print(f"[WARN] cam{ci}: auto z-window empty "
+                          f"(cube z in cam{ci}={zc_ci:.3f}m outside base ({z_min:.3f},{z_max:.3f})) (skip)")
+                continue
+        else:
+            z_min_ci, z_max_ci = z_min, z_max
+
+        pts_cam, pix = depth_to_points_cam(depth_u16, K_map[ci], ds, z_min_ci, z_max_ci, stride)
         if pts_cam.shape[0] == 0:
+            if verbose:
+                print(f"[INFO] cam{ci}: z-range=({z_min_ci:.3f}, {z_max_ci:.3f}) 안에 점 0개 (skip)")
             continue
 
         raw_n = int(pts_cam.shape[0])
@@ -797,14 +860,16 @@ def _fuse_depth_single_frame(
             mask = cube_roi_mask_in_ref(pts_ref, T_cube_depth, roi_half)
             kept = int(np.count_nonzero(mask))
             if kept == 0:
+                if verbose:
+                    print(f"[INFO] cam{ci}: raw={raw_n} 점 중 cube OBB 안 0개 (skip)")
                 continue
             pts_ref = pts_ref[mask]
             pix_arr = pix_arr[mask]
             if verbose:
-                print(f"[INFO] cam{ci}: raw={raw_n}  roi={kept} points fused")
+                print(f"[INFO] cam{ci}: z=({z_min_ci:.3f},{z_max_ci:.3f}) raw={raw_n}  roi={kept} points fused")
         else:
             if verbose:
-                print(f"[INFO] cam{ci}: {raw_n} points fused")
+                print(f"[INFO] cam{ci}: z=({z_min_ci:.3f},{z_max_ci:.3f}) {raw_n} points fused")
 
         cols = rgb[pix_arr[:, 0], pix_arr[:, 1]].astype(np.float64)
         frame_pts.append(pts_ref)
@@ -911,13 +976,19 @@ def main():
     cfg = CubeConfig()
     cube = ArucoCubeTarget(cfg)
     print("[INFO] Cube face_roll_deg:", {int(k): float(v) for k, v in sorted(cfg.face_roll_deg.items())})
-    print("[INFO] PnP mode: single_marker_only=True (best marker per frame)")
+    print("[INFO] PnP mode: 다중 마커 우선, 부족하면 best single fallback "
+          f"(IPPE flip prior 재해소: rot 편차 > {FLIP_ROT_DEG_THRESH:.0f}°)")
 
     pnp_by_frame = collect_pnp_all_frames(
         args.root_folder, cam_indices, frame_ids, cube, K_map, D_map, args.reproj_max_px
     )
     if len(pnp_by_frame) == 0:
         raise RuntimeError("No valid PnP observations collected from any frame.")
+
+    resolve_ippe_flips_with_prior(
+        pnp_by_frame, T_ref, args.ref_cam_idx,
+        args.root_folder, cube, K_map, D_map, args.reproj_max_px,
+    )
 
     obs_by_frame, all_obs = build_ref_pose_observations(pnp_by_frame, T_ref)
     if len(all_obs) == 0:
@@ -1000,23 +1071,19 @@ def main():
         stride = max(1, int(args.depth_stride))
         z_min = float(args.depth_z_min)
         z_max = float(args.depth_z_max)
+        z_window_half_m: Optional[float] = None
         if args.depth_auto_z_window_m > 0:
-            zc = float(T_cube_for_z[2, 3])
-            w = float(args.depth_auto_z_window_m)
-            z_min_auto = zc - w
-            z_max_auto = zc + w
-            z_min = max(z_min, z_min_auto)
-            z_max = min(z_max, z_max_auto)
+            z_window_half_m = float(args.depth_auto_z_window_m)
             print(
-                f"[INFO] Depth z-range: base=({args.depth_z_min:.3f}, {args.depth_z_max:.3f}) "
-                f"auto_centered=({z_min_auto:.3f}, {z_max_auto:.3f}) -> effective=({z_min:.3f}, {z_max:.3f})"
+                f"[INFO] Depth z-range: base=({z_min:.3f}, {z_max:.3f})  "
+                f"per-camera auto z-window ±{z_window_half_m*1000:.0f}mm around cube center"
             )
         else:
-            print(f"[INFO] Depth z-range: effective=({z_min:.3f}, {z_max:.3f})")
+            print(f"[INFO] Depth z-range: effective=({z_min:.3f}, {z_max:.3f}) (no auto window)")
         if z_max <= z_min:
             raise RuntimeError(
-                f"Invalid depth z-range after auto-centering: z_min={z_min:.3f}, z_max={z_max:.3f}. "
-                "Adjust --depth_auto_z_window_m or base z range."
+                f"Invalid depth z-range: z_min={z_min:.3f}, z_max={z_max:.3f}. "
+                "Adjust base --depth_z_min/--depth_z_max."
             )
 
         roi_half = None
@@ -1063,6 +1130,7 @@ def main():
                     roi_half=roi_half,
                     T_cube_depth=T_cube_frame,
                     verbose=False,
+                    z_window_half_m=z_window_half_m,
                 )
                 if f_pts:
                     n_frame = sum(p.shape[0] for p in f_pts)
@@ -1092,6 +1160,7 @@ def main():
                 depth_cube_roi=args.depth_cube_roi,
                 roi_half=roi_half,
                 T_cube_depth=T_cube_depth,
+                z_window_half_m=z_window_half_m,
             )
             T_cube_viz = T_cube_depth
             ply_name = f"depth_fusion_frame{args.frame_idx:05d}.ply"

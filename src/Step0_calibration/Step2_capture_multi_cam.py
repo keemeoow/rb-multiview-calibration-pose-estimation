@@ -2,22 +2,14 @@
 # 멀티캠 캡처 (Step4까지 할 거면 depth 저장 필수)
 
 """
-Depth는 기본 저장 (Step3/4에서 필수). depth를 끄려면 --no_save_depth.
+[자동 캡처 모드 - SPACE 없이 조건 충족 시 자동 저장]
+  --auto_save --stable_frames 5 --cooldown_ms 1000 \
 
-[최소 마커 인식 1개 이상]
 python Step2_capture_multi_cam.py \
   --root_folder ./data/cube_session_01 \
   --intrinsics_dir ./intrinsics \
   --fps 15 --width 640 --height 480 \
   --min_markers 1 \
-  --show
-
-python Step2_capture_multi_cam.py \
-  --root_folder ./data/cube_session_01 \
-  --intrinsics_dir ./intrinsics \
-  --fps 15 --width 640 --height 480 \
-  --min_markers 2 \
-  --auto_save --stable_frames 3 --cooldown_ms 700 \
   --show
 """
 
@@ -25,9 +17,10 @@ import os
 import json
 import time
 import argparse
-from typing import Dict
+from typing import Dict, Optional
 
 import cv2
+import numpy as np
 import sys
 
 # Allow running this script from inside src/Step0_calibration by adding the
@@ -44,6 +37,39 @@ from _aruco_cube import CubeConfig, ArucoCubeTarget
 def ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
+
+
+def capture_depth_burst(cam, n_frames: int, max_wait_ms: int = 1500):
+    """카메라에서 ts_ms 가 다른 N장의 depth 프레임을 모은다.
+    Returns (n, H, W) uint16 ndarray 또는 None."""
+    depths = []
+    last_ts = None
+    start_t = time.monotonic()
+    while len(depths) < n_frames:
+        elapsed_ms = (time.monotonic() - start_t) * 1000.0
+        if elapsed_ms > max_wait_ms:
+            break
+        _, depth, ts_ms = cam.get_latest()
+        if depth is None or ts_ms == last_ts:
+            time.sleep(0.003)
+            continue
+        depths.append(depth)
+        last_ts = ts_ms
+    if not depths:
+        return None
+    return np.stack(depths, axis=0)
+
+
+def median_depth_ignore_zero(stack: Optional[np.ndarray]):
+    """Per-pixel median of (N, H, W) uint16 depth stack, ignoring zeros."""
+    if stack is None or stack.shape[0] == 0:
+        return None
+    f = stack.astype(np.float32)
+    f = np.where(f > 0, f, np.nan)
+    with np.errstate(invalid="ignore"):
+        med = np.nanmedian(f, axis=0)
+    med = np.where(np.isnan(med), 0.0, med)
+    return med.astype(np.uint16)
 
 
 def load_device_map(intr_dir: str):
@@ -75,6 +101,11 @@ def main():
                         help="Save aligned depth (default: ON).")
     parser.add_argument("--no_save_depth", dest="save_depth", action="store_false",
                         help="Disable depth saving.")
+    parser.add_argument("--depth_burst_n", type=int, default=10,
+                        help="저장 시점 직후 N장 depth burst median으로 노이즈 감소 (default: 10). "
+                             "1로 두면 단일 프레임 저장.")
+    parser.add_argument("--depth_burst_max_wait_ms", type=int, default=1500,
+                        help="N장을 모으는 데 허용하는 최대 시간(ms).")
     parser.add_argument("--no_align_depth_to_color", action="store_true")
     parser.add_argument("--camera_frame_timeout_ms", type=int, default=2000)
     parser.add_argument("--log_cam_timeouts", action="store_true")
@@ -122,6 +153,11 @@ def main():
             "[INFO] depth align_to_color:",
             "OFF" if args.no_align_depth_to_color else "ON",
         )
+        if args.depth_burst_n > 1:
+            print(f"[INFO] depth temporal median: {args.depth_burst_n} frames per save "
+                  f"(max wait {args.depth_burst_max_wait_ms}ms)")
+        else:
+            print("[INFO] depth temporal median: OFF (single frame)")
 
     cams = {}
     for ci, serial in idx_serial_pairs:
@@ -200,18 +236,41 @@ def main():
                 }
 
             if args.show:
-                for ci in sorted(frames.keys()):
-                    img = frames[ci]["color"].copy()
-                    ids_np = frames[ci]["ids_np"]
-                    corners = frames[ci]["corners"]
-                    if ids_np is not None:
-                        try:
-                            cv2.aruco.drawDetectedMarkers(img, corners, ids_np)
-                        except Exception:
-                            pass
-                    txt = f"cam{ci} ok={frames[ci]['ok']} stable={stable_cnt[ci]} ids={frames[ci]['ids']}"
-                    cv2.putText(img, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    cv2.imshow(f"cam{ci}", img)
+                panels = []
+                for ci in sorted(cams.keys()):
+                    if ci in frames and frames[ci]["color"] is not None:
+                        img = frames[ci]["color"].copy()
+                        ids_np = frames[ci]["ids_np"]
+                        corners = frames[ci]["corners"]
+                        if ids_np is not None:
+                            try:
+                                cv2.aruco.drawDetectedMarkers(img, corners, ids_np)
+                            except Exception:
+                                pass
+                        txt = (f"cam{ci} ok={frames[ci]['ok']} "
+                               f"stable={stable_cnt[ci]} ids={frames[ci]['ids']}")
+                        color_ok = (0, 255, 0) if frames[ci]['ok'] else (0, 0, 255)
+                        cv2.putText(img, txt, (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+                        cv2.putText(img, txt, (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_ok, 1)
+                    else:
+                        img = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+                        cv2.putText(img, f"cam{ci} NO FRAME", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    panels.append(img)
+                if panels:
+                    h0, w0 = panels[0].shape[:2]
+                    for i in range(len(panels)):
+                        if panels[i].shape[:2] != (h0, w0):
+                            panels[i] = cv2.resize(panels[i], (w0, h0))
+                    # 2x2 그리드: 위 2개, 아래 2개 (cell이 부족하면 검은 placeholder 채움)
+                    while len(panels) < 4:
+                        panels.append(np.zeros((h0, w0, 3), dtype=np.uint8))
+                    top    = np.hstack(panels[0:2])
+                    bottom = np.hstack(panels[2:4])
+                    combined = np.vstack([top, bottom])
+                    cv2.imshow("multi_cam", combined)
 
             if args.log_cam_stats_sec > 0.0:
                 now_mono = time.monotonic()
@@ -263,7 +322,23 @@ def main():
                     if args.save_depth and (fr["depth"] is not None):
                         depth_rel = f"cam{ci}/depth_{fid:05d}.png"
                         depth_abs = os.path.join(root, depth_rel)
-                        cv2.imwrite(depth_abs, fr["depth"])
+                        if args.depth_burst_n > 1:
+                            burst = capture_depth_burst(
+                                cams[ci],
+                                args.depth_burst_n,
+                                args.depth_burst_max_wait_ms,
+                            )
+                            depth_to_save = median_depth_ignore_zero(burst)
+                            if depth_to_save is None:
+                                depth_to_save = fr["depth"]
+                            else:
+                                got = int(burst.shape[0])
+                                if got < args.depth_burst_n:
+                                    print(f"[WARN] cam{ci}: burst {got}/{args.depth_burst_n} "
+                                          f"frames in {args.depth_burst_max_wait_ms}ms")
+                        else:
+                            depth_to_save = fr["depth"]
+                        cv2.imwrite(depth_abs, depth_to_save)
 
                     cap_rec["cams"][str(ci)] = {
                         "saved": True,

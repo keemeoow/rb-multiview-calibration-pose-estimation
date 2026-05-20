@@ -190,7 +190,13 @@ class ArucoCubeTarget:
         img_pts = np.concatenate(img_pts).reshape(-1, 1, 2).astype(np.float64)
         return obj_pts, img_pts, used
 
-    def _solve_and_score(self, obj_pts, img_pts, K, D, use_ransac: bool, marker_id: Optional[int] = None):
+    def _solve_and_score(self, obj_pts, img_pts, K, D, use_ransac: bool,
+                         marker_id: Optional[int] = None,
+                         prior_T_C_O: Optional[np.ndarray] = None):
+        """
+        prior_T_C_O: (4,4) optional. 단일 마커 IPPE 해 모호성을 prior pose로 해결.
+        주어지면 IPPE 후보 중 prior와 가장 가까운 (rot+trans) 해를 우선 선택.
+        """
         n = int(obj_pts.shape[0])
 
         if n >= 8:
@@ -258,7 +264,25 @@ class ArucoCubeTarget:
                     )
                 )
 
-            if marker_id is not None and marker_id in self.cfg.id_to_face:
+            if prior_T_C_O is not None:
+                # prior pose로 IPPE 두 해 모호성 해결
+                # score = rot_deg + trans_mm  (1° ~ 1mm 등가 가중)
+                prior_R = np.asarray(prior_T_C_O[:3, :3], dtype=np.float64)
+                prior_t = np.asarray(prior_T_C_O[:3, 3], dtype=np.float64).reshape(3)
+                for c in candidates:
+                    R_cand, _ = cv2.Rodrigues(c["rvec"])
+                    R_diff = prior_R.T @ R_cand
+                    cos_t = (np.trace(R_diff) - 1.0) / 2.0
+                    c["rot_deg"] = float(
+                        np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0)))
+                    )
+                    t_cand = c["tvec"].reshape(3)
+                    c["trans_mm"] = float(np.linalg.norm(prior_t - t_cand) * 1000.0)
+
+                def rank(c):
+                    tier = 0 if c["z_ok"] else 1
+                    return (tier, c["rot_deg"] + c["trans_mm"], c["err_mean"])
+            elif marker_id is not None and marker_id in self.cfg.id_to_face:
                 # 1) z_ok & vis_ok  2) z_ok  3) fallback
                 def rank(c):
                     tier = 2
@@ -299,6 +323,7 @@ class ArucoCubeTarget:
         mean_err_max_px: Optional[float] = None,
         single_marker_only: bool = False,
         return_reproj: bool = False,
+        prior_T_C_O: Optional[np.ndarray] = None,
     ):
         """
         기본 동작:
@@ -354,13 +379,27 @@ class ArucoCubeTarget:
             if obj_pts is None:
                 continue
 
-            sol = self._solve_and_score(obj_pts, img_pts, K, D, use_ransac, marker_id=mid)
+            sol = self._solve_and_score(
+                obj_pts, img_pts, K, D, use_ransac,
+                marker_id=mid, prior_T_C_O=prior_T_C_O,
+            )
             if sol is None:
                 continue
 
-            err_mean = float(np.mean(sol["err"]))
-            if err_mean < best_err:
-                best_err     = err_mean
+            if prior_T_C_O is not None:
+                # 마커 간 선택도 prior 거리 기준 (IPPE 해 모호성 1차 해소 후)
+                prior_R = np.asarray(prior_T_C_O[:3, :3], dtype=np.float64)
+                prior_t = np.asarray(prior_T_C_O[:3, 3], dtype=np.float64).reshape(3)
+                R_cand, _ = cv2.Rodrigues(sol["rvec"])
+                cos_t = (np.trace(prior_R.T @ R_cand) - 1.0) / 2.0
+                rot_deg = float(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
+                trans_mm = float(np.linalg.norm(prior_t - sol["tvec"].reshape(3)) * 1000.0)
+                score = rot_deg + trans_mm
+            else:
+                score = float(np.mean(sol["err"]))
+
+            if score < best_err:
+                best_err     = score
                 best_sol     = sol
                 best_used    = used
                 best_obj_pts = obj_pts

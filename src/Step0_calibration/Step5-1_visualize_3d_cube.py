@@ -1,11 +1,11 @@
-# visualize_3d.py
+# Step5-1_visualize_3d_cube.py
 """
 Matplotlib 3D로 시각화:
   - 큐브 형상 + 각 면의 마커 ID
   - 각 카메라의 위치 및 방향 (PnP로 추정)
 
 실행:
-  python visualize_3d.py \
+  python Step5-1_visualize_3d_cube.py \
     --root_folder ./data/cube_session_01 \
     --intrinsics_dir ./data/_intrinsics
 """

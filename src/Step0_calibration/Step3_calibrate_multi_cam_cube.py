@@ -1,5 +1,11 @@
 # Step3_calibrate_multi_cam_cube.py
 # 캘리브레이션(카메라 간 변환 계산)
+#
+# 항상 적용되는 동작:
+#   (1) 다중 마커 PnP 우선 (single_marker_only=False)
+#       → 한 카메라에 마커 2개 이상 보이면 IPPE 모호성 없음
+#   (2) Per-frame T_Cref_Ci 추정값에서 회전 outlier(주로 IPPE flip) 자동 배제
+#       → 초기 평균 대비 회전 편차 > FLIP_ROT_DEG_THRESH 인 프레임 제외 후 재평균
 
 """
 python Step3_calibrate_multi_cam_cube.py \
@@ -11,6 +17,9 @@ python Step3_calibrate_multi_cam_cube.py \
   --save_overlay \
   --overlay_max_per_cam 30
 """
+
+# 카메라 간 회전이 이 임계값(deg)을 넘으면 IPPE flip 등 outlier로 간주하고 배제
+FLIP_ROT_DEG_THRESH = 30.0
 
 import os
 import json
@@ -43,6 +52,27 @@ def load_intrinsics(intr_dir: str, cam_idx: int):
 
 def parse_frame_id_from_rgb_path(rgb_path: str) -> int:
     return int(os.path.basename(rgb_path).split("_")[-1].split(".")[0])
+
+
+def parse_exclude_frames(spec: Optional[str]) -> set:
+    """
+    "37-76,80,100-110" 같은 문자열을 frame_id set으로 변환.
+    PnP 정확도를 떨어뜨리는 구간(큐브가 카메라들 외곽에 위치한 프레임 등)을
+    캘리브에서 제외할 때 사용한다.
+    """
+    if not spec:
+        return set()
+    out = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            a, b = tok.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(tok))
+    return out
 
 
 def draw_overlay(img_bgr, corners_list, ids, img_pts, proj_pts, text_lines):
@@ -86,6 +116,11 @@ class CubeCam:
         self.frames.append(fr)
 
 
+def rotation_angle_deg(R1: np.ndarray, R2: np.ndarray) -> float:
+    c = (np.trace(R1.T @ R2) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+
 def se3_avg_weighted(T_list: List[np.ndarray],
                      weights: Optional[List[float]] = None) -> np.ndarray:
     """
@@ -127,7 +162,15 @@ def main():
                         help="PnP 허용 reproj 오차 (IPPE 수정 후 5px 권장)")
     parser.add_argument("--save_overlay",        action="store_true")
     parser.add_argument("--overlay_max_per_cam", type=int,   default=30)
+    parser.add_argument("--exclude_frames",      type=str,   default=None,
+                        help='제외할 frame_id (예: "37-76" 또는 "37-76,80,100-110"). '
+                             '큐브가 카메라 외곽에 위치해 PnP 품질이 낮은 구간을 제거할 때 사용.')
     args = parser.parse_args()
+
+    excluded_frames = parse_exclude_frames(args.exclude_frames)
+    if excluded_frames:
+        print(f"[INFO] Exclude frames: {len(excluded_frames)}개 "
+              f"(예: {sorted(excluded_frames)[:5]}{'...' if len(excluded_frames) > 5 else ''})")
 
     root     = args.root_folder
     intr_dir = args.intrinsics_dir
@@ -149,7 +192,8 @@ def main():
     cfg  = CubeConfig()
     cube = ArucoCubeTarget(cfg)
     print("[INFO] Cube face_roll_deg:", {int(k): float(v) for k, v in sorted(cfg.face_roll_deg.items())})
-    print("[INFO] PnP mode: single_marker_only=True (best marker per frame)")
+    print("[INFO] PnP mode: 다중 마커 우선, 부족하면 best single fallback "
+          f"(IPPE flip 자동 배제: rot 편차 > {FLIP_ROT_DEG_THRESH:.0f}°)")
 
     K_map, D_map = {}, {}
     for ci in cams:
@@ -170,8 +214,12 @@ def main():
     for ci, cam in cams.items():
         overlay_saved = 0
         err_list = []
+        skipped_n = 0
 
         for fr in cam.frames:
+            if fr.frame_id in excluded_frames:
+                skipped_n += 1
+                continue
             img = cv2.imread(os.path.join(root, fr.rgb_path))
             if img is None:
                 continue
@@ -181,7 +229,7 @@ def main():
                 use_ransac=args.use_ransac,
                 min_markers=args.min_markers,
                 reproj_thr_mean_px=args.reproj_max_px,
-                single_marker_only=True,
+                single_marker_only=False,
                 return_reproj=True,
             )
             if not ok or reproj is None:
@@ -223,8 +271,9 @@ def main():
         n_ok  = len(cam.T_C_O)
         n_all = len(cam.frames)
         mean_err = float(np.mean(err_list)) if err_list else float("nan")
+        excl_str = f"  (excluded={skipped_n})" if skipped_n else ""
         print(f"[INFO] cam{ci}: {n_ok}/{n_all} 프레임 성공  "
-              f"reproj_mean={mean_err:.3f}px")
+              f"reproj_mean={mean_err:.3f}px{excl_str}")
 
     # ------------------------------------------------------------------ #
     # 2) 공통 프레임으로 카메라 간 변환 계산 (가중 평균)
@@ -282,28 +331,114 @@ def main():
             print(f"[WARN] cam{ci}: 유효 공통 프레임 0개 → skip")
             continue
 
-        # 가중 평균 (robust_se3_average 있으면 우선 사용)
-        if robust_se3_average is not None:
-            T_avg = robust_se3_average(T_list)
+        # 1차 평균(전체) → IPPE flip 등 회전 outlier 자동 배제
+        T_init = (robust_se3_average(T_list)
+                  if robust_se3_average is not None
+                  else se3_avg_weighted(T_list, weights))
+        rot_devs = [rotation_angle_deg(T[:3, :3], T_init[:3, :3]) for T in T_list]
+        keep_idx = [i for i, d in enumerate(rot_devs) if d <= FLIP_ROT_DEG_THRESH]
+        flipped_fids = [used_fids[i] for i, d in enumerate(rot_devs) if d > FLIP_ROT_DEG_THRESH]
+
+        if len(keep_idx) < len(T_list):
+            print(f"[INFO] cam{ci}: IPPE flip 자동 배제 {len(flipped_fids)}개 "
+                  f"(>{FLIP_ROT_DEG_THRESH:.0f}° rot 편차) frames={flipped_fids}")
+        if len(keep_idx) < 2:
+            print(f"[WARN] cam{ci}: outlier 배제 후 남은 프레임 {len(keep_idx)}개 → "
+                  f"전체 사용으로 fallback")
+            keep_idx = list(range(len(T_list)))
+
+        T_list_c   = [T_list[i] for i in keep_idx]
+        weights_c  = [weights[i] for i in keep_idx]
+        used_fids_c = [used_fids[i] for i in keep_idx]
+
+        # 2차 평균(클린) → prior 후보
+        if robust_se3_average is not None and len(T_list_c) >= 3:
+            T_prior = robust_se3_average(T_list_c)
         else:
-            T_avg = se3_avg_weighted(T_list, weights)
+            T_prior = se3_avg_weighted(T_list_c, weights_c)
+
+        # ------------------------------------------------------------------ #
+        # Pass 3: outlier(IPPE flip) 프레임을 prior로 재시도해 살림
+        #   단일 마커 IPPE 두 해 중 prior(T_Cref_Ci)와 일치하는 해 선택
+        # ------------------------------------------------------------------ #
+        rescued = 0
+        for fid in list(flipped_fids):
+            # ref 카메라가 해당 프레임에서 다중 마커 PnP면 prior 신뢰도 높음
+            ref_n = int(ref_cam.reproj[fid]["used_markers"])
+            if ref_n < 2:
+                continue
+            fr = next((f for f in cam.frames if f.frame_id == fid), None)
+            if fr is None:
+                continue
+            img = cv2.imread(os.path.join(root, fr.rgb_path))
+            if img is None:
+                continue
+
+            # cam_i 시점의 prior pose: T_Ci_O = inv(T_Cref_Ci) @ T_Cref_O
+            T_Cref_O = ref_cam.T_C_O[fid]
+            prior_T_Ci_O = inv_T(T_prior) @ T_Cref_O
+
+            ok, rvec, tvec, used, reproj = cube.solve_pnp_cube(
+                img, K_map[ci], D_map[ci],
+                use_ransac=args.use_ransac,
+                min_markers=args.min_markers,
+                reproj_thr_mean_px=args.reproj_max_px,
+                single_marker_only=False,
+                return_reproj=True,
+                prior_T_C_O=prior_T_Ci_O,
+            )
+            if not ok or reproj is None:
+                continue
+            T_Ci_O_new = rodrigues_to_Rt(rvec, tvec)
+            T_Cref_Ci_new = T_Cref_O @ inv_T(T_Ci_O_new)
+            new_dev = rotation_angle_deg(T_Cref_Ci_new[:3, :3], T_prior[:3, :3])
+            if new_dev > FLIP_ROT_DEG_THRESH:
+                continue  # 여전히 outlier → 포기
+
+            cam.T_C_O[fid] = T_Ci_O_new
+            cam.reproj[fid] = {
+                "ok":           True,
+                "used_ids":     [int(x) for x in used],
+                "used_markers": int(len(used)),
+                "n_points":     int(reproj["n_points"]),
+                "err_mean":     float(reproj["err_mean"]),
+                "err_median":   float(reproj["err_median"]),
+                "err_p90":      float(reproj["err_p90"]),
+                "rvec":         np.asarray(rvec).reshape(3, 1).astype(float).tolist(),
+                "tvec":         np.asarray(tvec).reshape(3, 1).astype(float).tolist(),
+            }
+            T_list_c.append(T_Cref_Ci_new)
+            weights_c.append(
+                1.0 / max(ref_cam.reproj[fid]["err_mean"] * reproj["err_mean"], 1e-9)
+            )
+            used_fids_c.append(fid)
+            rescued += 1
+
+        if rescued > 0:
+            print(f"[INFO] cam{ci}: prior 기반 IPPE 재해소 {rescued}개 프레임 추가 활용")
+
+        # 3차 평균(prior 재해소 포함) → 최종
+        if robust_se3_average is not None and len(T_list_c) >= 3:
+            T_avg = robust_se3_average(T_list_c)
+        else:
+            T_avg = se3_avg_weighted(T_list_c, weights_c)
 
         final_T[ci] = T_avg
 
-        # 가중치 기준 상위 기여 프레임 출력
-        w_arr   = np.array(weights)
-        w_norm  = w_arr / w_arr.sum()
+        # 가중치 기준 상위 기여 프레임 출력 (배제 후)
+        w_arr  = np.array(weights_c)
+        w_norm = w_arr / w_arr.sum()
         top_idx = np.argsort(w_norm)[::-1][:5]
         top_str = ", ".join(
-            f"f{used_fids[i]}({ref_cam.reproj[used_fids[i]]['err_mean']:.2f}"
-            f"/{cam.reproj[used_fids[i]]['err_mean']:.2f}px)"
+            f"f{used_fids_c[i]}({ref_cam.reproj[used_fids_c[i]]['err_mean']:.2f}"
+            f"/{cam.reproj[used_fids_c[i]]['err_mean']:.2f}px)"
             for i in top_idx
         )
 
         npy_path = os.path.join(out_root, f"T_C{ref_ci}_C{ci}.npy")
         np.save(npy_path, T_avg)
         print(f"[SAVE] T_C{ref_ci}_C{ci}.npy  "
-              f"공통 {len(common)}프레임 사용 "
+              f"공통 {len(common)}프레임 중 {len(keep_idx)}개 사용 "
               f"(동일마커 {same_marker_count}, 상이마커 {len(common)-same_marker_count})  "
               f"상위 기여: {top_str}")
 
