@@ -1,0 +1,145 @@
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ 
+# (mask_dir basename : instantmesh file) 매핑
+for pair in "obj01:obj1_result.glb" "obj02:obj2_result.glb" "obj03:obj3_result.glb"; do
+  MASK_DIR_NAME=${pair%:*}
+  IM_FILE=${pair#*:}
+  python src/Obj_Step4_improved_instantmesh_pose.py \
+    --data_dir ./capture_obj \
+    --mask_dir ./masks/$MASK_DIR_NAME \
+    --instantmesh_mesh ./instantmesh_result/$IM_FILE \
+    --out_dir ./outputs/$MASK_DIR_NAME \
+    --depth_scale 0.001 \
+    --mask_erode_px 5 \
+    --keep_largest_cc \
+done--apply_sim3_rotation0.005 \.1 \
+/home/sprout/anaconda3/envs/robot_multicam/lib/python3.8/site-packages/requests/__init__.py:86: RequestsDependencyWarning: Unable to find acceptable character detection dependency (chardet or charset_normalizer).
+  warnings.warn(
+Loaded cameras: ['cam0', 'cam1', 'cam2']
+Objects to process: ['0']
+
+=== Processing obj0 ===
+[cam0] mask pixels after preprocess: 1949
+[cam1] mask pixels after preprocess: 4293
+[cam2] mask pixels after preprocess: 4060
+[cam0] raw=1949, clean=609
+[cam1] raw=1963, clean=1014
+[cam2] raw=4009, clean=1812
+[obj0] DBSCAN: 3435 -> 3242 points (largest cluster only)
+[obj0] merged clean cloud: 3242 points
+[obj0] bbox_extents_m=[0.50561498 0.076633   0.14775352], center=[0.06467221 0.07196332 0.55965362]
+[cam0] view score=3530.7, mask_pixels=1949, compactness=0.708, depth_ratio=1.000
+[cam1] view score=4302.7, mask_pixels=4293, compactness=0.547, depth_ratio=0.457
+[cam2] view score=7535.7, mask_pixels=4060, compactness=0.748, depth_ratio=0.987
+Saved InstantMesh RGBA input: outputs/obj01/obj0/obj0_input.png
+[obj0] silhouette IoU per cam: cam0=0.000, cam1=0.000, cam2=0.012  mean=0.004
+[obj0] final_scale=0.00609394
+[obj0] saved scaled mesh: outputs/obj01/obj0/obj0_scaled.glb
+[obj0] saved scale report: outputs/obj01/obj0/obj0_scale_report.json
+
+Saved summary: outputs/obj01/objects_summary.json
+/home/sprout/anaconda3/envs/robot_multicam/lib/python3.8/site-packages/requests/__init__.py:86: RequestsDependencyWarning: Unable to find acceptable character detection dependency (chardet or charset_normalizer).
+  warnings.warn(
+Loaded cameras: ['cam0', 'cam1', 'cam2']
+Objects to process: ['0']
+
+=== Processing obj0 ===
+[cam0] mask pixels after preprocess: 2151
+[cam1] mask pixels after preprocess: 4647
+[cam2] mask pixels after preprocess: 1056
+[cam0] raw=2151, clean=471
+[cam1] raw=4504, clean=631
+[cam2] raw=1056, clean=444
+[obj0] DBSCAN: 1546 -> 1546 points (largest cluster only)
+[obj0] merged clean cloud: 1546 points
+[obj0] bbox_extents_m=[0.05333126 0.03196721 0.06730241], center=[0.1690896  0.06718024 0.47065121]
+[cam0] view score=3664.1, mask_pixels=2151, compactness=0.636, depth_ratio=1.000
+[cam1] view score=7159.6, mask_pixels=4647, compactness=0.549, depth_ratio=0.969
+[cam2] view score=1742.4, mask_pixels=1056, compactness=0.600, depth_ratio=1.000
+Saved InstantMesh RGBA input: outputs/obj02/obj0/obj0_input.png
+[obj0] silhouette IoU per cam: cam0=0.607, cam1=0.380, cam2=0.405  mean=0.464
+[obj0] final_scale=0.02688366
+[obj0] saved scaled mesh: outputs/obj02/obj0/obj0_scaled.glb
+[obj0] saved scale report: outputs/obj02/obj0/obj0_scale_report.json
+
+Saved summary: outputs/obj02/objects_summary.json
+/home/sprout/anaconda3/envs/robot_multicam/lib/python3.8/site-packages/requests/__init__.py:86: RequestsDependencyWarning: Unable to find acceptable character detection dependency (chardet or charset_normalizer).
+  warnings.warn(
+Loaded cameras: ['cam0', 'cam1', 'cam2']
+Objects to process: ['0']
+
+=== Processing obj0 ===
+[cam0] mask pixels after preprocess: 4133
+[cam1] mask pixels after preprocess: 3533
+[cam2] mask pixels after preprocess: 2539
+[cam0] raw=4119, clean=1063
+[cam1] raw=3471, clean=1109
+[cam2] raw=2538, clean=926
+[obj0] DBSCAN: 3098 -> 3098 points (largest cluster only)
+[obj0] merged clean cloud: 3098 points
+[obj0] bbox_extents_m=[0.07683004 0.02604424 0.14892987], center=[0.01848627 0.08539588 0.40163162]
+[cam0] view score=5707.0, mask_pixels=4133, compactness=0.423, depth_ratio=0.997
+[cam1] view score=6069.1, mask_pixels=3533, compactness=0.659, depth_ratio=0.982
+[cam2] view score=3760.0, mask_pixels=2539, compactness=0.488, depth_ratio=1.000
+Saved InstantMesh RGBA input: outputs/obj03/obj0/obj0_input.png
+[obj0] silhouette IoU per cam: cam0=0.136, cam1=0.064, cam2=0.049  mean=0.083
+[obj0] final_scale=0.02181986
+[obj0] saved scaled mesh: outputs/obj03/obj0/obj0_scaled.glb
+[obj0] saved scale report: outputs/obj03/obj0/obj0_scale_report.json
+
+Saved summary: outputs/obj03/objects_summary.json
+
+
+
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ python src/verify_mesh.py --outputs_dir ./outputs --data_dir ./capture_obj --mask_dir ./masks
+/home/sprout/anaconda3/envs/robot_multicam/lib/python3.8/site-packages/requests/__init__.py:86: RequestsDependencyWarning: Unable to find acceptable character detection dependency (chardet or charset_normalizer).
+  warnings.warn(
+
+========== obj01 ==========
+[1] mesh AABB extents (mm):   142.5 x   137.7 x   141.5
+    cloud bbox extents (mm):   505.6 x    76.6 x   147.8
+[2] final_scale=0.0746568  selected=grid_chamfer_probe  chamfer_score(scale_only)=0.0365 m
+    ICP refined_scale=0.0023753  median_nn_err=0.0013 m  warning=Rejected refined scale because it changed too much from selected candidate.
+[3] Chamfer mesh-vs-cloud (median, after centering both to origin):
+    mesh->cloud:  39.02 mm   cloud->mesh:  38.02 mm   symmetric:  38.52 mm
+[4] Silhouette IoU (mesh projection vs GT mask):
+    cam0: IoU = 0.137
+    cam1: IoU = 0.114
+    cam2: IoU = 0.179
+    => mean IoU = 0.143
+
+========== obj02 ==========
+[1] mesh AABB extents (mm):    67.1 x    71.1 x    35.4
+    cloud bbox extents (mm):    53.3 x    32.0 x    67.3
+[2] final_scale=0.0360148  selected=grid_chamfer_probe  chamfer_score(scale_only)=0.0060 m
+    ICP refined_scale=0.0268837  median_nn_err=0.0038 m  warning=Rejected refined scale because it changed too much from selected candidate.
+[3] Chamfer mesh-vs-cloud (median, after centering both to origin):
+    mesh->cloud:   8.54 mm   cloud->mesh:   4.77 mm   symmetric:   6.65 mm
+[4] Silhouette IoU (mesh projection vs GT mask):
+    cam0: IoU = 0.382
+    cam1: IoU = 0.434
+    cam2: IoU = 0.491
+    => mean IoU = 0.436
+
+========== obj03 ==========
+[1] mesh AABB extents (mm):    50.2 x   124.7 x    19.7
+    cloud bbox extents (mm):    76.8 x    26.0 x   148.9
+[2] final_scale=0.0631466  selected=grid_chamfer_probe  chamfer_score(scale_only)=0.0269 m
+    ICP refined_scale=0.0215685  median_nn_err=0.0012 m  warning=Rejected refined scale because it changed too much from selected candidate.
+[3] Chamfer mesh-vs-cloud (median, after centering both to origin):
+    mesh->cloud:  25.24 mm   cloud->mesh:  28.86 mm   symmetric:  27.05 mm
+[4] Silhouette IoU (mesh projection vs GT mask):
+    cam0: IoU = 0.230
+    cam1: IoU = 0.079
+    cam2: IoU = 0.139
+    => mean IoU = 0.149
+
+=========== SUMMARY ===========
+obj      final_scale  chamfer(mm)  mean_IoU  flag
+obj01       0.074657        38.52     0.143  HIGH_CHAMFER, LOW_IOU, ICP_REJECTED
+obj02       0.036015         6.65     0.436  LOW_IOU, ICP_REJECTED
+obj03       0.063147        27.05     0.149  HIGH_CHAMFER, LOW_IOU, ICP_REJECTED
+
+[SAVE] outputs/verify_summary.json
+[INFO] overlay images: outputs/<obj>/overlays/cam*_overlay.png
+[INFO] open with MeshLab: outputs/<obj>/verify_mesh_in_world.ply + verify_cloud_in_world.ply
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ 

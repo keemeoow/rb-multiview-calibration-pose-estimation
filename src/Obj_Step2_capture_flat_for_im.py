@@ -4,7 +4,7 @@
 Step2_capture_multi_cam.py 의 ArUco 큐브 검출이 빠진 간소화 버전.
 
 사용 예 (캘리브레이션 K/T 까지 한 번에 dump):
-  python src/Obj_Step3_capture_flat_for_im.py \
+  python src/Obj_Step2_capture_flat_for_im.py \
     --out_dir ./capture_obj \
     --intrinsics_dir src/Step0_calibration/intrinsics \
     --transforms_json src/Step0_calibration/data/cube_session_01/calib_out_cube/transforms/T_C0_Ci_all.json \
@@ -44,7 +44,7 @@ for _p in (str(REPO_ROOT), str(THIS_DIR)):
         sys.path.insert(0, _p)
 
 from src._camera import RealSenseCamera  # noqa: E402
-from Obj_Step2_dump_calib_to_flat import dump_calib_to_flat  # noqa: E402
+from Obj_Step1_dump_calib_to_flat import dump_calib_to_flat  # noqa: E402
 
 
 def capture_depth_burst(cam, n_frames: int, max_wait_ms: int = 1500) -> Optional[np.ndarray]:

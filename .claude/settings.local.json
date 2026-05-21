@@ -51,7 +51,17 @@
       "Bash(awk -F',' 'NR>1 && $1==39 {print \"cam0 f39:\", $0}' /home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/Step0_calibration/data/cube_session_01/calib_out_cube/calib_results/cam0_reproj.csv)",
       "Bash(awk -F',' 'NR>1 && $1==39 {print \"cam1 f39:\", $0}' /home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/Step0_calibration/data/cube_session_01/calib_out_cube/calib_results/cam1_reproj.csv)",
       "Bash(awk -F',' 'NR>1 && $1==39 {print \"cam2 f39:\", $0}' /home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/Step0_calibration/data/cube_session_01/calib_out_cube/calib_results/cam2_reproj.csv)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('Step4_fuse_depth_to_ref_pcd.py'\\).read\\(\\)\\); print\\('OK: syntax valid'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('Step4_fuse_depth_to_ref_pcd.py'\\).read\\(\\)\\); print\\('OK: syntax valid'\\)\")",
+      "Bash(python /tmp/diag_ply_faces.py)",
+      "Bash(python /tmp/diag_ply_faces2.py)",
+      "Bash(conda run -n sam2env python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/tsdf_fuse_mesh.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/Obj_Step4_improved_instantmesh_pose.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import cv2, numpy as np; m=cv2.imread\\('/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/masks/obj01/cam0_mask.png', cv2.IMREAD_UNCHANGED\\); print\\('mask shape:', m.shape, 'dtype:', m.dtype, 'unique:', np.unique\\(m\\)\\); d=cv2.imread\\('/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/capture_obj/cam0_depth.png', cv2.IMREAD_UNCHANGED\\); print\\('depth shape:', d.shape, 'dtype:', d.dtype, 'min/max:', d.min\\(\\), d.max\\(\\)\\)\")",
+      "Bash(python3 src/measure_size_from_masks.py --data_dir ./capture_obj --mask_dir ./masks --out ./outputs/size_measurements.json)",
+      "Bash(python3 src/measure_size_from_masks.py)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('src/Obj_Step3_generate_masks_sam2.py'\\).read\\(\\)\\); print\\('OK syntax'\\)\")",
+      "Bash(python3)"
     ],
     "additionalDirectories": [
       "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src"

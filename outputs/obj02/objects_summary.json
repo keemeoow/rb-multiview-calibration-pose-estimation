@@ -1,0 +1,22 @@
+{
+  "0": {
+    "obj_tag": "obj0",
+    "scaled_glb": "outputs/obj02/obj0/obj0_scaled.glb",
+    "scale": 0.0249397014,
+    "scale_report": "outputs/obj02/obj0/obj0_scale_report.json",
+    "cloud_clean_ply": "outputs/obj02/obj0/obj0_cloud_clean.ply",
+    "input_png": "outputs/obj02/obj0/obj0_input.png",
+    "best_cam": "cam1",
+    "forced_cam": null,
+    "bbox_extents_m": [
+      0.053331258444558216,
+      0.028690690572938063,
+      0.04904274907135214
+    ],
+    "center_world_m": [
+      0.1690896043936081,
+      0.06554198038358808,
+      0.4797810394577777
+    ]
+  }
+}

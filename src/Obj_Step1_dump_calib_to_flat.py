@@ -4,7 +4,7 @@
 flat 폴더 형식으로 dump.
 
 사용 예:
-  python src/Obj_Step2_dump_calib_to_flat.py \
+  python src/Obj_Step1_dump_calib_to_flat.py \
     --intrinsics_dir src/Step0_calibration/intrinsics \
     --transforms_json src/Step0_calibration/data/cube_session_01/calib_out_cube/transforms/T_C0_Ci_all.json \
     --out_dir ./capture_obj
