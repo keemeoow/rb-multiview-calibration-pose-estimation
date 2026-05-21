@@ -1,0 +1,25 @@
+{
+  "best_cam": "cam1",
+  "scores": {
+    "cam0": 3027.5471003826906,
+    "cam1": 3848.9563001336905,
+    "cam2": 2197.136274158912
+  },
+  "per_cam_info": {
+    "cam0": {
+      "n_pix": 4545,
+      "compactness": 0.44598174860170736,
+      "depth_valid_ratio": 0.9936193619361936
+    },
+    "cam1": {
+      "n_pix": 3953,
+      "compactness": 0.6605949197860963,
+      "depth_valid_ratio": 0.9739438401214268
+    },
+    "cam2": {
+      "n_pix": 2877,
+      "compactness": 0.5148532569792412,
+      "depth_valid_ratio": 0.9833159541188738
+    }
+  }
+}
