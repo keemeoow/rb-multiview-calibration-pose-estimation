@@ -1,0 +1,23 @@
+{
+  "mode": "interactive",
+  "capture_dir": "/Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/capture_obj",
+  "masks_dir": "/Users/woo/Documents/GitHub/Robot-Lab/rb-multiview-calibration-pose-estimation/masks",
+  "num_objects": 1,
+  "events": [
+    {
+      "cam_id": 0,
+      "obj_idx": 1,
+      "result": "saved"
+    },
+    {
+      "cam_id": 1,
+      "obj_idx": 1,
+      "result": "saved"
+    },
+    {
+      "cam_id": 2,
+      "obj_idx": 1,
+      "result": "saved"
+    }
+  ]
+}

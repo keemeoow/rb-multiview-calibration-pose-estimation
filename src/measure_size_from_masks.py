@@ -289,6 +289,7 @@ def measure_one_obj(
     cluster_eps_m: float,
     save_ply: Path | None,
     save_vis: Path | None,
+    depth_tol_m: float = 0.03,
 ) -> dict | None:
     print(f"\n========== {obj_name} ==========")
 
@@ -322,7 +323,7 @@ def measure_one_obj(
     print(f"  total raw: {len(pts)}")
 
     # 2) multi-view consensus
-    pts_filt, agree = consensus_filter(pts, cams, min_views=min_views)
+    pts_filt, agree = consensus_filter(pts, cams, min_views=min_views, depth_tol_m=depth_tol_m)
     print(f"  after consensus(min_views={min_views}): {len(pts_filt)}  "
           f"(views agreement: mean={agree.mean():.2f} max={int(agree.max())})")
     if len(pts_filt) < 50:
@@ -437,6 +438,9 @@ def main():
     ap.add_argument("--erode_px", type=int, default=2, help="마스크 erosion 픽셀 수")
     ap.add_argument("--cluster_eps_m", type=float, default=0.01,
                     help="DBSCAN 이웃 거리(m)")
+    ap.add_argument("--depth_tol_m", type=float, default=0.03,
+                    help="consensus: reprojected z vs measured depth 허용 차이(m). "
+                         "두꺼운/둥근 물체는 0.05~0.10 권장")
     ap.add_argument("--remove_plane", action="store_true",
                     help="RANSAC 으로 큰 평면(테이블) 제거 — 평면적 물체엔 끄세요")
     ap.add_argument("--save_ply_dir", default="./outputs/size_clouds",
@@ -467,6 +471,7 @@ def main():
             cluster_eps_m=args.cluster_eps_m,
             save_ply=save_ply,
             save_vis=save_vis,
+            depth_tol_m=args.depth_tol_m,
         )
         if r:
             results.append(r)
