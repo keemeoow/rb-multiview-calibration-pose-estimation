@@ -1,44 +1,62 @@
 {
-  "1": {
-    "scaled_glb": "outputs/obj1_scaled.glb",
-    "scale": 0.03508795279731902,
+  "obj1": {
+    "obj_tag": "obj1",
+    "scaled_glb": "outputs/obj1/obj1_scaled.glb",
+    "scale": 0.02345974350177517,
+    "scale_report": "outputs/obj1/obj1_scale_report.json",
+    "cloud_clean_ply": "outputs/obj1/obj1_cloud_clean.ply",
+    "input_png": "outputs/obj1/obj1_input.png",
+    "best_cam": "cam1",
+    "forced_cam": null,
     "bbox_extents_m": [
-      0.06699561691280997,
-      0.056815059752059416,
-      0.0705715327471319
+      0.05644984086331927,
+      0.051317239075935286,
+      0.017734660753444372
     ],
     "center_world_m": [
-      0.017295016399715604,
-      0.05311702572249592,
-      0.6242858126267703
+      0.03418688633853934,
+      0.04859258048098246,
+      0.6354630163489176
     ]
   },
-  "2": {
-    "scaled_glb": "outputs/obj2_scaled.glb",
-    "scale": 0.02898091072391801,
+  "obj2": {
+    "obj_tag": "obj2",
+    "scaled_glb": "outputs/obj2/obj2_scaled.glb",
+    "scale": 0.03134593677129499,
+    "scale_report": "outputs/obj2/obj2_scale_report.json",
+    "cloud_clean_ply": "outputs/obj2/obj2_cloud_clean.ply",
+    "input_png": "outputs/obj2/obj2_input.png",
+    "best_cam": "cam1",
+    "forced_cam": null,
     "bbox_extents_m": [
-      0.05397488751168503,
-      0.03326423941012292,
-      0.07015987299673027
+      0.04934808508762269,
+      0.04302308117549192,
+      0.031533021903737024
     ],
     "center_world_m": [
-      0.1692008047905259,
-      0.06747965340555223,
-      0.4714132848520689
+      0.1676677866407465,
+      0.0696948813399444,
+      0.48342409605496656
     ]
   },
-  "3": {
-    "scaled_glb": "outputs/obj3_scaled.glb",
-    "scale": 0.09852364320430643,
+  "obj3": {
+    "obj_tag": "obj3",
+    "scaled_glb": "outputs/obj3/obj3_scaled.glb",
+    "scale": 0.1005026047238214,
+    "scale_report": "outputs/obj3/obj3_scale_report.json",
+    "cloud_clean_ply": "outputs/obj3/obj3_cloud_clean.ply",
+    "input_png": "outputs/obj3/obj3_input.png",
+    "best_cam": "cam1",
+    "forced_cam": null,
     "bbox_extents_m": [
-      0.07831350188665478,
-      0.02746803554727019,
-      0.14900052065174013
+      0.15289633614642298,
+      0.04892946837524048,
+      0.020111478796580224
     ],
     "center_world_m": [
-      0.019075026742333096,
-      0.08514120993215094,
-      0.4017730060218512
+      0.019617997826373513,
+      0.08493681213155603,
+      0.3987657130463685
     ]
   }
 }

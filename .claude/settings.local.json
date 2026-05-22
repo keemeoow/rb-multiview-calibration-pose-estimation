@@ -61,7 +61,9 @@
       "Bash(python3 src/measure_size_from_masks.py --data_dir ./capture_obj --mask_dir ./masks --out ./outputs/size_measurements.json)",
       "Bash(python3 src/measure_size_from_masks.py)",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('src/Obj_Step3_generate_masks_sam2.py'\\).read\\(\\)\\); print\\('OK syntax'\\)\")",
-      "Bash(python3)"
+      "Bash(python3)",
+      "Bash(rm /home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/Obj_Step3_generate_masks_sam2.py && ls /home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/ | grep -i -E 'sam|step3')",
+      "Bash(python3 src/Obj_Step5_force_obb_scale.py --glb_root ./outputs --size_json ./outputs/size_measurements.json --suffix _obb)"
     ],
     "additionalDirectories": [
       "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src"

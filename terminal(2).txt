@@ -1,0 +1,235 @@
+[project terminal logging started]
+[log file] /home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/logs/terminal/20260521_215535_sprout_sprout.txt
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ PYTHONWARNINGS=ignore python3 src/Obj_Step4_measure_size_from_masks.py \
+  --data_dir ./capture_obj \
+  --mask_dir ./masks \
+  --out ./outputs/size_measurements.json \
+  --voxel_m 0.002 \
+  --min_views 2 \
+  --erode_px 2 \
+  --cluster_eps_m 0.01 \
+  --depth_tol_m 0.08 \
+  --save_ply_dir ./outputs/size_clouds \
+  --save_vis_dir ./outputs/size_vis
+
+========== obj1 ==========
+  cam0:   1938 pts (raw)
+  cam1:   8578 pts (raw)
+  cam2:   4025 pts (raw)
+  total raw: 14541
+  after consensus(min_views=2): 9921  (views agreement: mean=1.74 max=3)
+  largest cluster: 9921 / 9921
+  final: 1512 pts
+  AABB (mm):    67.1 x    47.8 x    63.1
+  OBB  (mm):    67.5 (long) x    60.2 (med) x    44.9 (short)
+  center(world m): [0.01666907 0.05367308 0.6298652 ]
+  [SAVE] outputs/size_clouds/obj1_world_pts.ply
+  [SAVE] outputs/size_vis/obj1_vis.png
+
+========== obj2 ==========
+  cam0:   2149 pts (raw)
+  cam1:   4412 pts (raw)
+  cam2:    993 pts (raw)
+  total raw: 7554
+  after consensus(min_views=2): 5051  (views agreement: mean=1.90 max=3)
+  largest cluster: 3983 / 5051
+  final: 564 pts
+  AABB (mm):    36.2 x    24.8 x    40.9
+  OBB  (mm):    50.1 (long) x    39.7 (med) x    22.2 (short)
+  center(world m): [0.17761504 0.06795998 0.48378189]
+  [SAVE] outputs/size_clouds/obj2_world_pts.ply
+  [SAVE] outputs/size_vis/obj2_vis.png
+
+========== obj3 ==========
+  cam0:   4059 pts (raw)
+  cam1:   3388 pts (raw)
+  cam2:   2505 pts (raw)
+  total raw: 9952
+  after consensus(min_views=2): 6896  (views agreement: mean=1.94 max=3)
+  largest cluster: 6895 / 6896
+  final: 2025 pts
+  AABB (mm):    77.7 x    21.6 x   148.3
+  OBB  (mm):   152.6 (long) x    45.5 (med) x    16.0 (short)
+  center(world m): [0.02291744 0.08754999 0.39966634]
+  [SAVE] outputs/size_clouds/obj3_world_pts.ply
+  [SAVE] outputs/size_vis/obj3_vis.png
+
+=========== SUMMARY (mm) ===========
+obj          long      med    short   pts
+obj1         67.5     60.2     44.9   1512
+obj2         50.1     39.7     22.2   564
+obj3        152.6     45.5     16.0   2025
+
+[SAVE] outputs/size_measurements.json
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calib
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ m
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ mgrep '^obj'); do
+kdir -p meshesstantmesh_result/${name}_result.glb meshes/${name}.gl
+for name in $(ls masks | grep '^obj'); do
+  ln -sf ../instantmesh_result/${name}_result.glb meshes/${name}.glbYTHONWARNINGS=ignore python3 src/Obj_Step4최종_improved_instantmes
+donese.py \
+PYTHONWARNINGS=ignore python3 src/Obj_Step4최종_improved_instantmesh_pose.py \r ./masks \
+  --data_dir ./capture_obj \s \
+  --mask_dir ./masks \\
+  --instantmesh_mesh ./meshes \
+  --out_dir ./outputs \
+  --depth_scale 0.001
+Loaded cameras: ['cam0', 'cam1', 'cam2']
+Objects to process: ['obj1', 'obj2', 'obj3']
+
+=== Processing obj1 ===
+[cam0] mask pixels after preprocess: 1938
+[cam1] mask pixels after preprocess: 8603
+[cam2] mask pixels after preprocess: 4030
+[cam0] raw=1938, clean=608
+[cam1] raw=8598, clean=1029
+[cam2] raw=4030, clean=827
+[obj1] multi-stage DBSCAN cleanup:
+    [DBSCAN stage 1, eps=15.0mm] 2464 -> 2464
+    [DBSCAN stage 2, eps=5.0mm] 2464 -> 1029
+[obj1] DBSCAN total: 2464 -> 1029 points
+[obj1] merged clean cloud: 1029 points
+[obj1] bbox_extents_m=[0.03399911 0.04715406 0.04954887], center=[0.03371181 0.04987341 0.63423296]
+[cam0] view score=3499.2, mask_pixels=1938, compactness=0.704, depth_ratio=1.000
+[cam1] view score=14851.2, mask_pixels=8603, compactness=0.651, depth_ratio=0.999
+[cam2] view score=7092.2, mask_pixels=4030, compactness=0.673, depth_ratio=1.000
+Saved InstantMesh RGBA input: outputs/obj1/obj1_input.png
+[obj1] silhouette IoU per cam: cam0=0.300, cam1=0.555, cam2=0.280  mean=0.379
+[obj1] final_scale=0.02111377
+[obj1] saved scaled mesh: outputs/obj1/obj1_scaled.glb
+[obj1] saved scale report: outputs/obj1/obj1_scale_report.json
+
+=== Processing obj2 ===
+[cam0] mask pixels after preprocess: 2149
+[cam1] mask pixels after preprocess: 4540
+[cam2] mask pixels after preprocess: 993
+[cam0] raw=2149, clean=468
+[cam1] raw=4412, clean=575
+[cam2] raw=993, clean=419
+[obj2] multi-stage DBSCAN cleanup:
+    [DBSCAN stage 1, eps=15.0mm] 1462 -> 1462
+    [DBSCAN stage 2, eps=5.0mm] 1462 -> 994
+[obj2] DBSCAN total: 1462 -> 994 points
+[obj2] merged clean cloud: 994 points
+[obj2] bbox_extents_m=[0.05225837 0.02853602 0.04763881], center=[0.16898361 0.06553831 0.4804607 ]
+[cam0] view score=3658.8, mask_pixels=2149, compactness=0.635, depth_ratio=1.000
+[cam1] view score=7036.9, mask_pixels=4540, compactness=0.553, depth_ratio=0.972
+[cam2] view score=1616.8, mask_pixels=993, compactness=0.585, depth_ratio=1.000
+Saved InstantMesh RGBA input: outputs/obj2/obj2_input.png
+[obj2] silhouette IoU per cam: cam0=0.320, cam1=0.355, cam2=0.380  mean=0.352
+[obj2] final_scale=0.03744445
+[obj2] saved scaled mesh: outputs/obj2/obj2_scaled.glb
+[obj2] saved scale report: outputs/obj2/obj2_scale_report.json
+
+=== Processing obj3 ===
+[cam0] mask pixels after preprocess: 4129
+[cam1] mask pixels after preprocess: 3463
+[cam2] mask pixels after preprocess: 2514
+[cam0] raw=4114, clean=1064
+[cam1] raw=3403, clean=1095
+[cam2] raw=2513, clean=915
+[obj3] multi-stage DBSCAN cleanup:
+    [DBSCAN stage 1, eps=15.0mm] 3074 -> 3074
+    [DBSCAN stage 2, eps=5.0mm] 3074 -> 3072
+[obj3] DBSCAN total: 3074 -> 3072 points
+[obj3] merged clean cloud: 3072 points
+[obj3] bbox_extents_m=[0.0765885  0.02570007 0.14892987], center=[0.01860205 0.08556797 0.40163162]
+[cam0] view score=5698.0, mask_pixels=4129, compactness=0.422, depth_ratio=0.996
+[cam1] view score=5863.6, mask_pixels=3463, compactness=0.642, depth_ratio=0.983
+[cam2] view score=3677.0, mask_pixels=2514, compactness=0.475, depth_ratio=1.000
+Saved InstantMesh RGBA input: outputs/obj3/obj3_input.png
+[obj3] silhouette IoU per cam: cam0=0.185, cam1=0.069, cam2=0.113  mean=0.122
+[obj3] final_scale=0.07692445
+[obj3] saved scaled mesh: outputs/obj3/obj3_scaled.glb
+[obj3] saved scale report: outputs/obj3/obj3_scale_report.json
+
+Saved summary: outputs/objects_summary.json
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ rm outputs/obj{1,2,3}_scaled.glb outputs/obj{1,2,3}_input.png \
+   outputs/obj{1,2,3}_cloud_clean.ply outputs/obj{1,2,3}_bbox_metric.json
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ PYTHONWARNINGS=ignore python3 src/Obj_Step4최종_improved_instantmesh_pose.py \
+  --data_dir ./capture_obj --mask_dir ./masks \
+  --instantmesh_mesh ./meshes \
+  --out_dir ./outputs --depth_scale 0.001 \
+  --use_oriented_bbox \
+  --scale_method bbox
+Loaded cameras: ['cam0', 'cam1', 'cam2']
+Objects to process: ['obj1', 'obj2', 'obj3']
+
+=== Processing obj1 ===
+[cam0] mask pixels after preprocess: 1938
+[cam1] mask pixels after preprocess: 8603
+[cam2] mask pixels after preprocess: 4030
+[cam0] raw=1938, clean=608
+[cam1] raw=8598, clean=1029
+[cam2] raw=4030, clean=827
+[obj1] multi-stage DBSCAN cleanup:
+    [DBSCAN stage 1, eps=15.0mm] 2464 -> 2464
+    [DBSCAN stage 2, eps=5.0mm] 2464 -> 1029
+[obj1] DBSCAN total: 2464 -> 1029 points
+[obj1] merged clean cloud: 1029 points
+[obj1] bbox_extents_m=[0.05644984 0.05131724 0.01773466], center=[0.03418689 0.04859258 0.63546302]
+[cam0] view score=3499.2, mask_pixels=1938, compactness=0.704, depth_ratio=1.000
+[cam1] view score=14851.2, mask_pixels=8603, compactness=0.651, depth_ratio=0.999
+[cam2] view score=7092.2, mask_pixels=4030, compactness=0.673, depth_ratio=1.000
+Saved InstantMesh RGBA input: outputs/obj1/obj1_input.png
+[obj1] silhouette IoU per cam: cam0=0.312, cam1=0.625, cam2=0.277  mean=0.405
+[obj1] final_scale=0.02345974
+[obj1] saved scaled mesh: outputs/obj1/obj1_scaled.glb
+[obj1] saved scale report: outputs/obj1/obj1_scale_report.json
+
+=== Processing obj2 ===
+[cam0] mask pixels after preprocess: 2149
+[cam1] mask pixels after preprocess: 4540
+[cam2] mask pixels after preprocess: 993
+[cam0] raw=2149, clean=468
+[cam1] raw=4412, clean=575
+[cam2] raw=993, clean=419
+[obj2] multi-stage DBSCAN cleanup:
+    [DBSCAN stage 1, eps=15.0mm] 1462 -> 1462
+    [DBSCAN stage 2, eps=5.0mm] 1462 -> 994
+[obj2] DBSCAN total: 1462 -> 994 points
+[obj2] merged clean cloud: 994 points
+[obj2] bbox_extents_m=[0.04934809 0.04302308 0.03153302], center=[0.16766779 0.06969488 0.4834241 ]
+[cam0] view score=3658.8, mask_pixels=2149, compactness=0.635, depth_ratio=1.000
+[cam1] view score=7036.9, mask_pixels=4540, compactness=0.553, depth_ratio=0.972
+[cam2] view score=1616.8, mask_pixels=993, compactness=0.585, depth_ratio=1.000
+Saved InstantMesh RGBA input: outputs/obj2/obj2_input.png
+[obj2] silhouette IoU per cam: cam0=0.334, cam1=0.411, cam2=0.372  mean=0.372
+[obj2] final_scale=0.03134594
+[obj2] saved scaled mesh: outputs/obj2/obj2_scaled.glb
+[obj2] saved scale report: outputs/obj2/obj2_scale_report.json
+
+=== Processing obj3 ===
+[cam0] mask pixels after preprocess: 4129
+[cam1] mask pixels after preprocess: 3463
+[cam2] mask pixels after preprocess: 2514
+[cam0] raw=4114, clean=1064
+[cam1] raw=3403, clean=1095
+[cam2] raw=2513, clean=915
+[obj3] multi-stage DBSCAN cleanup:
+    [DBSCAN stage 1, eps=15.0mm] 3074 -> 3074
+    [DBSCAN stage 2, eps=5.0mm] 3074 -> 3072
+[obj3] DBSCAN total: 3074 -> 3072 points
+[obj3] merged clean cloud: 3072 points
+[obj3] bbox_extents_m=[0.15289634 0.04892947 0.02011148], center=[0.019618   0.08493681 0.39876571]
+[cam0] view score=5698.0, mask_pixels=4129, compactness=0.422, depth_ratio=0.996
+[cam1] view score=5863.6, mask_pixels=3463, compactness=0.642, depth_ratio=0.983
+[cam2] view score=3677.0, mask_pixels=2514, compactness=0.475, depth_ratio=1.000
+Saved InstantMesh RGBA input: outputs/obj3/obj3_input.png
+[obj3] silhouette IoU per cam: cam0=0.169, cam1=0.064, cam2=0.097  mean=0.110
+[obj3] final_scale=0.10050260
+[obj3] saved scaled mesh: outputs/obj3/obj3_scaled.glb
+[obj3] saved scale report: outputs/obj3/obj3_scale_report.json
+
+Saved summary: outputs/objects_summary.json
+(robot_multicam) sprout@sprout:~/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation$ 
