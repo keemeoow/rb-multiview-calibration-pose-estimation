@@ -9,13 +9,8 @@
 
 """
 python Step3_calibrate_multi_cam_cube.py \
-  --root_folder ./data/cube_session_01 \
-  --intrinsics_dir ./intrinsics \
-  --ref_cam_idx 0 \
-  --min_markers 1 \
-  --reproj_max_px 5 \
-  --save_overlay \
-  --overlay_max_per_cam 30
+  --root_folder ./data/cube_session_01 --intrinsics_dir ./intrinsics \
+  --ref_cam_idx 0 --min_markers 1 --reproj_max_px 5 --save_overlay
 """
 
 # 카메라 간 회전이 이 임계값(deg)을 넘으면 IPPE flip 등 outlier로 간주하고 배제
@@ -165,6 +160,9 @@ def main():
     parser.add_argument("--exclude_frames",      type=str,   default=None,
                         help='제외할 frame_id (예: "37-76" 또는 "37-76,80,100-110"). '
                              '큐브가 카메라 외곽에 위치해 PnP 품질이 낮은 구간을 제거할 때 사용.')
+    parser.add_argument("--reject_kmad",         type=float, default=2.5,
+                        help="robust_se3_average 내부 MAD 임계 (작을수록 엄격, default 2.5). "
+                             "예: 1.5 ~ 2.0 으로 줄이면 비정상 프레임 자동 거부 더 적극적.")
     args = parser.parse_args()
 
     excluded_frames = parse_exclude_frames(args.exclude_frames)
@@ -418,8 +416,28 @@ def main():
             print(f"[INFO] cam{ci}: prior 기반 IPPE 재해소 {rescued}개 프레임 추가 활용")
 
         # 3차 평균(prior 재해소 포함) → 최종
+        # robust_se3_average 가 MAD(k_mad) 기반 자동 outlier 거부를 수행.
+        # 거부된 프레임 ID 를 노출해 정확도가 떨어지는 프레임을 사용자에게 보고.
         if robust_se3_average is not None and len(T_list_c) >= 3:
-            T_avg = robust_se3_average(T_list_c)
+            T_avg, inlier_mask = robust_se3_average(
+                T_list_c, k_mad=args.reject_kmad, return_inliers=True
+            )
+            rejected_idx = [i for i, ok in enumerate(inlier_mask) if not ok]
+            if rejected_idx:
+                # 각 거부 프레임의 평균 대비 편차(mm, deg) 함께 표시
+                R_avg = T_avg[:3, :3]
+                t_avg = T_avg[:3, 3]
+                rejected_details = []
+                for i in rejected_idx:
+                    R_i = T_list_c[i][:3, :3]
+                    t_i = T_list_c[i][:3, 3]
+                    rot_dev = rotation_angle_deg(R_i, R_avg)
+                    trans_dev_mm = float(np.linalg.norm(t_i - t_avg) * 1000.0)
+                    rejected_details.append(
+                        f"f{used_fids_c[i]}(Δt={trans_dev_mm:.1f}mm,Δr={rot_dev:.2f}°)"
+                    )
+                print(f"[INFO] cam{ci}: auto-reject {len(rejected_idx)}개 "
+                      f"(k_mad={args.reject_kmad}) → {', '.join(rejected_details)}")
         else:
             T_avg = se3_avg_weighted(T_list_c, weights_c)
 

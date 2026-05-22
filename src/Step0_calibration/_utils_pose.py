@@ -72,7 +72,8 @@ def se3_distance(Ta: np.ndarray, Tb: np.ndarray, w_rot=1.0, w_trans=1.0) -> floa
     dtrans = np.linalg.norm(ta - tb)
     return float(w_rot * dang + w_trans * dtrans)
 
-def robust_se3_average(T_list, max_iters=5, k_mad=2.5, return_stats=False):
+def robust_se3_average(T_list, max_iters=5, k_mad=2.5,
+                       return_stats=False, return_inliers=False):
     """
     Robust mean of SE3 via:
       - initial mean (quat Markley + trans mean)
@@ -81,6 +82,7 @@ def robust_se3_average(T_list, max_iters=5, k_mad=2.5, return_stats=False):
     Returns:
       T_mean
       (optional) stats dict
+      (optional) inlier_mask  (np.ndarray bool, same length as T_list)
     """
     if len(T_list) == 0:
         raise ValueError("T_list is empty")
@@ -154,6 +156,11 @@ def robust_se3_average(T_list, max_iters=5, k_mad=2.5, return_stats=False):
         "translation_mean_mm": float(np.mean(trans_devs)),
     }
 
+    extras = []
     if return_stats:
-        return T_mean, stats
+        extras.append(stats)
+    if return_inliers:
+        extras.append(inlier_mask.copy())
+    if extras:
+        return (T_mean, *extras)
     return T_mean

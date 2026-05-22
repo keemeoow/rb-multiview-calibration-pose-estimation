@@ -63,7 +63,16 @@
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('src/Obj_Step3_generate_masks_sam2.py'\\).read\\(\\)\\); print\\('OK syntax'\\)\")",
       "Bash(python3)",
       "Bash(rm /home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/Obj_Step3_generate_masks_sam2.py && ls /home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/ | grep -i -E 'sam|step3')",
-      "Bash(python3 src/Obj_Step5_force_obb_scale.py --glb_root ./outputs --size_json ./outputs/size_measurements.json --suffix _obb)"
+      "Bash(python3 src/Obj_Step5_force_obb_scale.py --glb_root ./outputs --size_json ./outputs/size_measurements.json --suffix _obb)",
+      "Bash(rmdir data *)",
+      "Bash(mv ~/.local/share/Trash/files/data.10 ./data)",
+      "Bash(mv ~/.local/share/Trash/files/intrinsics.10 ./intrinsics)",
+      "Bash(rm ~/.local/share/Trash/info/data.10.trashinfo ~/.local/share/Trash/info/intrinsics.10.trashinfo)",
+      "Bash(python3 Step3_calibrate_multi_cam_cube.py --help)",
+      "Bash(awk -F',' 'NR==1 || \\($1>=41 && $1<=46\\)' data/cube_session_01/calib_out_cube/calib_results/cam0_reproj.csv)",
+      "Bash(awk -F',' 'NR==1 || \\($1>=41 && $1<=46\\)' data/cube_session_01/calib_out_cube/calib_results/cam1_reproj.csv)",
+      "Bash(awk -F',' 'NR==1 || \\($1>=41 && $1<=46\\)' data/cube_session_01/calib_out_cube/calib_results/cam2_reproj.csv)",
+      "Bash(python3 -m json.tool)"
     ],
     "additionalDirectories": [
       "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src"

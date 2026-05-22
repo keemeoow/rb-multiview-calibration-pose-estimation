@@ -1,0 +1,52 @@
+{
+  "capture_dir": "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/capture_obj_set4",
+  "masks_dir": "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/masks_set4",
+  "num_objects": 3,
+  "events": [
+    {
+      "cam_id": 0,
+      "obj_idx": 1,
+      "result": "saved"
+    },
+    {
+      "cam_id": 0,
+      "obj_idx": 2,
+      "result": "saved"
+    },
+    {
+      "cam_id": 0,
+      "obj_idx": 3,
+      "result": "saved"
+    },
+    {
+      "cam_id": 1,
+      "obj_idx": 1,
+      "result": "saved"
+    },
+    {
+      "cam_id": 1,
+      "obj_idx": 2,
+      "result": "saved"
+    },
+    {
+      "cam_id": 1,
+      "obj_idx": 3,
+      "result": "saved"
+    },
+    {
+      "cam_id": 2,
+      "obj_idx": 1,
+      "result": "saved"
+    },
+    {
+      "cam_id": 2,
+      "obj_idx": 2,
+      "result": "saved"
+    },
+    {
+      "cam_id": 2,
+      "obj_idx": 3,
+      "result": "saved"
+    }
+  ]
+}

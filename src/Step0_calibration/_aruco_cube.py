@@ -145,6 +145,9 @@ class ArucoCubeTarget:
         d = getattr(cv2.aruco, cfg.dictionary_name)
         self.dictionary = cv2.aruco.getPredefinedDictionary(d)
         self.params = cv2.aruco.DetectorParameters()
+        # Sub-pixel corner refinement (APRILTAG > SUBPIX > CONTOUR > NONE).
+        # 코너 정확도 ~0.4px → ~0.15px 수준으로 좁혀 triangulation 잔차를 직접 낮춤.
+        self.params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
         self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.params)
 
     def detect(self, bgr) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:

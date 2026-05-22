@@ -1,0 +1,30 @@
+{
+  "intrinsics_dir": "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/Step0_calibration/intrinsics",
+  "transforms_json": "/home/sprout/Desktop/**jiwoo/rb-multiview-calibration-pose-estimation/src/Step0_calibration/data/cube_session_01/calib_out_cube/transforms/T_C0_Ci_all.json",
+  "ref_cam_idx": 0,
+  "world_frame": "cam0",
+  "K_source": "color_K",
+  "cameras": [
+    {
+      "cam_idx": 0,
+      "serial": "039422061216",
+      "K_file": "cam0_K.txt",
+      "T_file": "cam0_T_cam_to_world.txt",
+      "depth_scale_m_per_unit": 0.0010000000474974513
+    },
+    {
+      "cam_idx": 1,
+      "serial": "314522062542",
+      "K_file": "cam1_K.txt",
+      "T_file": "cam1_T_cam_to_world.txt",
+      "depth_scale_m_per_unit": 0.0010000000474974513
+    },
+    {
+      "cam_idx": 2,
+      "serial": "912322060991",
+      "K_file": "cam2_K.txt",
+      "T_file": "cam2_T_cam_to_world.txt",
+      "depth_scale_m_per_unit": 0.0010000000474974513
+    }
+  ]
+}
