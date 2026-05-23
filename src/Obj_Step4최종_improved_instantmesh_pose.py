@@ -14,6 +14,13 @@ PYTHONWARNINGS=ignore python3 src/Obj_Step4최종_improved_instantmesh_pose.py \
   --scale_method bbox
 
 
+  PYTHONWARNINGS=ignore python3 src/Obj_Step4최종_improved_instantmesh_pose.py \
+  --data_dir ./capture_obj_set2 --mask_dir ./masks_set2 \
+  --instantmesh_mesh ./instantmesh_result_set2 \
+  --out_dir ./outputs_set2 --depth_scale 0.001 \
+  --use_oriented_bbox \
+  --scale_method bbox
+
 [실행 명령어-2]
 mkdir -p outputs
 

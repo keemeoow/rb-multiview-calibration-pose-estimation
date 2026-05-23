@@ -12,6 +12,11 @@ python3 src/Obj_Step5_force_obb_scale.py \
   --size_json ./outputs/size_measurements.json \
   --suffix _obb
 
+  python3 src/Obj_Step5_force_obb_scale.py \
+  --glb_root ./outputs_set2 \
+  --size_json ./outputs_set2/size_measurements.json \
+  --suffix _obb
+  
 → outputs/obj{N}/obj{N}_scaled_obb.glb 생성. (원본 보존)
 """
 
