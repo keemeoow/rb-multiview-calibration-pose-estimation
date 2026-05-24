@@ -1,0 +1,62 @@
+{
+  "obj1": {
+    "obj_tag": "obj1",
+    "scaled_glb": "outputs_set4/obj1/obj1_scaled.glb",
+    "scale": 0.11278608743554842,
+    "scale_report": "outputs_set4/obj1/obj1_scale_report.json",
+    "cloud_clean_ply": "outputs_set4/obj1/obj1_cloud_clean.ply",
+    "input_png": "outputs_set4/obj1/obj1_input.png",
+    "best_cam": "cam1",
+    "forced_cam": null,
+    "bbox_extents_m": [
+      0.12266192777039801,
+      0.12798577155958418,
+      0.0860225114756487
+    ],
+    "center_world_m": [
+      0.059044015015418734,
+      -0.045838632573412814,
+      0.5177360735985486
+    ]
+  },
+  "obj2": {
+    "obj_tag": "obj2",
+    "scaled_glb": "outputs_set4/obj2/obj2_scaled.glb",
+    "scale": 0.23174379563330472,
+    "scale_report": "outputs_set4/obj2/obj2_scale_report.json",
+    "cloud_clean_ply": "outputs_set4/obj2/obj2_cloud_clean.ply",
+    "input_png": "outputs_set4/obj2/obj2_input.png",
+    "best_cam": "cam0",
+    "forced_cam": null,
+    "bbox_extents_m": [
+      0.17960634026404637,
+      0.025555772093004407,
+      0.016208548261702566
+    ],
+    "center_world_m": [
+      0.07849652268640236,
+      0.027955913359577072,
+      0.3688450518608607
+    ]
+  },
+  "obj3": {
+    "obj_tag": "obj3",
+    "scaled_glb": "outputs_set4/obj3/obj3_scaled.glb",
+    "scale": 0.22691741952968536,
+    "scale_report": "outputs_set4/obj3/obj3_scale_report.json",
+    "cloud_clean_ply": "outputs_set4/obj3/obj3_cloud_clean.ply",
+    "input_png": "outputs_set4/obj3/obj3_input.png",
+    "best_cam": "cam0",
+    "forced_cam": null,
+    "bbox_extents_m": [
+      0.13489164573711654,
+      0.04825878455171942,
+      0.02550965712441525
+    ],
+    "center_world_m": [
+      -0.051334780166315555,
+      0.03141454413838228,
+      0.34742513188870683
+    ]
+  }
+}
